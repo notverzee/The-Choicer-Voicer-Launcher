@@ -1,0 +1,6 @@
+#define IDB_SIDEIMAGE 100
+#define IDI_APPICON   101
+
+IDB_SIDEIMAGE  BITMAP  "sideimage.bmp"
+IDI_APPICON    ICON    "appicon.ico"
+1              24      "manifest.xml"

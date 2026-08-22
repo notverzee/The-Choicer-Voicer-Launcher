@@ -1,0 +1,49 @@
+Building "The Choicer Voicer Launcher.exe" from source
+========================================================
+
+Plain C using the native Win32 API, plus the vendored miniz library
+(public domain) for reading .zip files. RAR extraction shells out to
+7-Zip or WinRAR if either is installed - no bundled RAR decoder.
+
+On Windows, with mingw-w64 installed (e.g. via MSYS2, MinGW64 shell):
+
+    windres resource.rc -O coff -o resource.o
+    gcc -municode -O2 main.c resource.o miniz\miniz.c miniz\miniz_tinfl.c miniz\miniz_tdef.c miniz\miniz_zip.c -o "The Choicer Voicer Launcher.exe" -mwindows -lcomctl32 -lshell32 -lgdi32 -luser32 -s -I miniz
+
+Files:
+  main.c          - the launcher's window/logic, including version discovery and the mod installer
+  resource.rc     - embeds sideimage.bmp, appicon.ico, and manifest.xml
+  manifest.xml    - turns on themed buttons/group boxes + DPI awareness
+  sideimage.bmp   - the character art shown on the left of the launcher
+  appicon.ico     - the launcher's own taskbar/exe icon
+  miniz\          - vendored miniz (public domain), reads .zip files in-memory
+
+REQUIRED FOLDER LAYOUT next to the launcher exe:
+
+  <launcher folder>\
+    The Choicer Voicer Launcher.exe
+    Normal\
+      <any folder name>\
+        YourGame.exe
+        display.txt      <- whatever text is in here shows up in the dropdown
+      <another folder>\
+        ...
+    Compatibility\
+      <any folder name>\
+        YourGame.exe
+        display.txt
+      ...
+
+Rules the launcher follows when scanning Normal\ and Compatibility\:
+  - Each direct subfolder is treated as one version.
+  - It looks for exactly one .exe in that subfolder - that's what Launch runs.
+  - It looks for one .txt in that subfolder - its full contents (trimmed)
+    become the dropdown label. Name the .txt file anything you want.
+  - If there's no .txt, the folder name itself is used as the label.
+  - If there's no .exe, that folder is skipped entirely (not shown).
+  - Scanning happens once, when the launcher starts - relaunch it after
+    adding/removing a version folder to see the change.
+
+To change the pack folders offered in the mod installer, edit the
+PACK_FOLDERS[] array in main.c. To change the Get Mods link, edit
+GAMEBANANA_URL.
