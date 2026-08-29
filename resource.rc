@@ -1,6 +1,10 @@
 #define IDB_SIDEIMAGE 100
 #define IDI_APPICON   101
+#define IDB_BGLIGHT   102
+#define IDB_BGDARK    103
 
 IDB_SIDEIMAGE  BITMAP  "sideimage.bmp"
 IDI_APPICON    ICON    "appicon.ico"
+IDB_BGLIGHT    BITMAP  "bg_light.bmp"
+IDB_BGDARK     BITMAP  "bg_dark.bmp"
 1              24      "manifest.xml"
