@@ -1564,8 +1564,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         /* small subtitle under the drop zone explaining that GameBanana
            wants the actual download link, not the mod page link */
-        g_overlayLabels[3].text = L"Tip: drag the mod's actual DOWNLOAD link here, not the mod page link. "
-            L"Open the mod page on GameBanana, click Download, then drag that link here.";
+        g_overlayLabels[3].text = L"Tip: For the link method to work, add a https:// in front of the 'gamebanana.com/mod' link. The downloader won't work without it. Download links [https://gamebanana.com/dl/######] also work.";
         g_overlayLabels[3].rect = (RECT){ g_dropZoneRect.left, g_dropZoneRect.bottom + 4,
                                            g_dropZoneRect.left + 620, g_dropZoneRect.bottom + 4 + 32 };
         g_overlayLabels[3].font = g_fontSmall;
