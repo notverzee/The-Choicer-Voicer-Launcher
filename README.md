@@ -17,14 +17,18 @@ You can add as many versions as you wish inside the normal and compatibility fol
 
 You can also add the launcher to Steam as a Non-Steam Game, and opening it will open the launcher, and opening one of the games you've added will still work seamlessly.
 ## How To Mod
-Inside the launcher, there are three points of interest below the basic functionality:
+Inside the launcher, there are four points of interest below the basic functionality:
+- Browse Mods
 - Get Mods
 - Modding Folder
-- Install downloaded mod to: / Drag a .zip or .rar mod file or gamebanana link here
+- Install downloaded mod to: / Drag a .zip or .rar mod file or GameBanana link here
+
+The main and most recommended modding method is the Browse Mods page, which allows you to search and find any mod for the game, and also to download them all in the same application.
+<img width="652" height="637" alt="Screenshot 2026-09-06 232907" src="https://github.com/user-attachments/assets/2e1b6c3e-b287-4fae-b66b-7e9b60a99a50" />
 
 Pressing "Get Mods" redirects you to the GameBanana page for The Choicer Voicer. When you download your mods, you can go into the launcher again, press the drag & drop menu for the right folder it needs to go into, and you drag your mod(s) to the box below. It automatically extracts the zip/rar file(s) and makes them work immediately.
 
-Gamebanana links have to include the https:// at the bginning of it or it will NOT work.
+Gamebanana links have to include the https:// at the bginning of it, or it will NOT work.
 
 (NOTICE): If a mod has a weirder setup, like a readme.txt next to where the main folder is in the zip, it may not work as intended, so make sure it worked properly by pressing the 'Modding Folder' button to enter your mods folder before double-checking if it extracted correctly.)
 
