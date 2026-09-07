@@ -11,7 +11,18 @@
 #include <wininet.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+/* forces the WIC GUIDs (CLSID_WICImagingFactory etc.) used for decoding
+   downloaded mod thumbnails to be defined directly in this object file,
+   rather than relying on them being present in the MinGW distribution's
+   libuuid.a - some older/leaner distributions don't carry them, and this
+   avoids that link-time gamble entirely. Scoped to just before wincodec.h
+   so it doesn't touch how the already-working COM GUIDs used elsewhere
+   in this file (IID_IDropTarget, etc.) get resolved. */
+#include <initguid.h>
+#include <wincodec.h>
+#include <windowsx.h>
 #include <wchar.h>
+#include <wctype.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -42,6 +53,9 @@
 #define ID_README_CLOSE   4002
 #define ID_README_INFO    4003
 
+#define ID_TAB_LAUNCHER    5001
+#define ID_TAB_BROWSE      5002
+
 #define IDB_SIDEIMAGE   100
 #define IDI_APPICON     101
 #define IDB_BGLIGHT     102
@@ -53,6 +67,18 @@ static const wchar_t* COMPAT_DIR_NAME = L"Compatibility";
 
 static const wchar_t* GAME_DIR_SUBPATH = L"\\YeahMaybe\\ChoicerVoicer\\game";
 static const wchar_t* GAMEBANANA_URL = L"https://gamebanana.com/games/20674";
+/* must stay in sync with the numeric suffix of GAMEBANANA_URL above */
+static const long GAMEBANANA_GAME_ID = 20674;
+/* "Dub Mode" - confirmed via two real captured requests (both sort
+   variants) where every single returned record, 30 for 30, had
+   _aGame._idRow == GAMEBANANA_GAME_ID. Unlike _aFilters[Generic_Game],
+   which never reliably scoped results in testing, this actually works -
+   this game's mods all live under this one root category. Used for the
+   Mod/Index browse/sort fetch; Util/Search/Results still uses
+   _idGameRow directly, since that's the parameter its own real captured
+   request used and there's no evidence yet either way on whether it'd
+   accept a category filter too. */
+static const long GAMEBANANA_CATEGORY_ID = 44064;
 static const wchar_t* README_URL =
     L"https://github.com/notverzee/The-Choicer-Voicer-Launcher/blob/main/README.md";
 
@@ -88,6 +114,25 @@ static BOOL   g_darkMode = FALSE;
 static BOOL   g_readmeShown = FALSE;
 static HINSTANCE g_hInstance = NULL;
 
+/* ---- tabs: "Launcher" (the existing UI) vs "Browse Mods" (new) ---- */
+typedef enum { TAB_LAUNCHER = 0, TAB_BROWSE = 1 } AppTab;
+static AppTab g_activeTab = TAB_LAUNCHER;
+static HWND   g_hTabLauncherBtn = NULL;
+static HWND   g_hTabBrowseBtn = NULL;
+
+/* every real child window that belongs to the Launcher tab's content (not
+   the header/tabs, which stay visible on both tabs) gets tracked here so
+   switching tabs is just a show/hide loop over this list */
+#define MAX_LAUNCHER_PAGE_WNDS 24
+static HWND g_launcherPageWnds[MAX_LAUNCHER_PAGE_WNDS];
+static int  g_launcherPageWndCount = 0;
+static void TrackLauncherPageWnd(HWND h)
+{
+    if (h && g_launcherPageWndCount < MAX_LAUNCHER_PAGE_WNDS) {
+        g_launcherPageWnds[g_launcherPageWndCount++] = h;
+    }
+}
+
 /* ---- animated backdrop: tinted image + slow pulsing/drifting stars ---- */
 #define NUM_STARS 40
 #define ANIM_TIMER_ID 1
@@ -119,6 +164,7 @@ typedef struct {
     const wchar_t* text;
     RECT rect;
     HFONT font;
+    BOOL visible;
 } OverlayLabel;
 
 #define NUM_OVERLAY_LABELS 4
@@ -146,6 +192,7 @@ static HWND g_hLaunchCompatBtn = NULL;
 /* ---- persisted settings (last version played per mode, dark mode) ---- */
 static wchar_t g_lastNormalExe[MAX_PATH] = L"";
 static wchar_t g_lastCompatExe[MAX_PATH] = L"";
+static wchar_t g_lastPackFolder[64] = L"";
 
 /* ===================== small path/file helpers ===================== */
 
@@ -275,6 +322,7 @@ static void LoadSettings(void)
 {
     g_lastNormalExe[0] = 0;
     g_lastCompatExe[0] = 0;
+    g_lastPackFolder[0] = 0;
     g_darkMode = FALSE;
     g_readmeShown = FALSE;
 
@@ -309,6 +357,9 @@ static void LoadSettings(void)
             g_darkMode = (lineStart[9] == L'1');
         } else if (_wcsnicmp(lineStart, L"ReadmeShown=", 12) == 0) {
             g_readmeShown = (lineStart[12] == L'1');
+        } else if (_wcsnicmp(lineStart, L"PackFolder=", 11) == 0) {
+            wcsncpy(g_lastPackFolder, lineStart + 11, 63);
+            g_lastPackFolder[63] = 0;
         }
     }
     free(text);
@@ -319,9 +370,9 @@ static void SaveSettings(void)
     wchar_t path[MAX_PATH];
     GetSettingsPath(path);
 
-    wchar_t content[3 * MAX_PATH + 64];
-    wsprintfW(content, L"NormalLastExe=%s\r\nCompatLastExe=%s\r\nDarkMode=%d\r\nReadmeShown=%d\r\n",
-        g_lastNormalExe, g_lastCompatExe, g_darkMode ? 1 : 0, g_readmeShown ? 1 : 0);
+    wchar_t content[3 * MAX_PATH + 128];
+    wsprintfW(content, L"NormalLastExe=%s\r\nCompatLastExe=%s\r\nDarkMode=%d\r\nReadmeShown=%d\r\nPackFolder=%s\r\n",
+        g_lastNormalExe, g_lastCompatExe, g_darkMode ? 1 : 0, g_readmeShown ? 1 : 0, g_lastPackFolder);
 
     HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -452,7 +503,7 @@ static void PaintAnimatedBackdrop(HDC hdc, int w, int h)
     SetTextColor(g_hMemDC, g_darkMode ? COLOR_DARK_TEXT : COLOR_LIGHT_TEXT);
     for (int i = 0; i < NUM_OVERLAY_LABELS; i++) {
         OverlayLabel* lbl = &g_overlayLabels[i];
-        if (!lbl->text) continue;
+        if (!lbl->text || !lbl->visible) continue;
         HGDIOBJ oldLblFont = lbl->font ? SelectObject(g_hMemDC, lbl->font) : NULL;
         RECT r = lbl->rect;
         DrawTextW(g_hMemDC, lbl->text, -1, &r, DT_LEFT | DT_TOP | DT_WORDBREAK);
@@ -899,80 +950,12 @@ static void GetArchiveBaseName(const wchar_t* path, wchar_t* out)
     if (dot) *dot = 0;
 }
 
-/* ===================== local file drop entry point ===================== */
-
-static void ProcessDroppedFile(HWND hwnd, const wchar_t* filePath)
-{
-    size_t len = wcslen(filePath);
-    BOOL isZip = (len > 4 && _wcsicmp(filePath + len - 4, L".zip") == 0);
-    BOOL isRar = (len > 4 && _wcsicmp(filePath + len - 4, L".rar") == 0);
-
-    if (!isZip && !isRar) {
-        MessageBoxW(hwnd, L"Only .zip and .rar files are supported.",
-            L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
-        return;
-    }
-
-    wchar_t gameDir[MAX_PATH];
-    if (!GetAppDataGameDir(gameDir) || !PathIsDirW(gameDir)) {
-        wchar_t msg[512];
-        wsprintfW(msg,
-            L"The game's data folder doesn't exist yet:\n%s\n\n"
-            L"Run the game at least once first.", gameDir);
-        MessageBoxW(hwnd, msg, L"The Choicer Voicer - Launcher", MB_ICONINFORMATION | MB_OK);
-        return;
-    }
-
-    int sel = (int)SendMessageW(g_hPackCombo, CB_GETCURSEL, 0, 0);
-    if (sel < 0 || sel >= NUM_PACK_FOLDERS) sel = 0;
-    const wchar_t* packName = PACK_FOLDERS[sel];
-
-    wchar_t destPackDir[MAX_PATH];
-    wsprintfW(destPackDir, L"%s\\%s", gameDir, packName);
-    EnsureDirW(destPackDir);
-
-    wchar_t tempDir[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempDir);
-    wchar_t stagingDir[MAX_PATH];
-    static LONG s_stagingCounter = 0;
-    wsprintfW(stagingDir, L"%scvlauncher_staging_%lu_%ld",
-        tempDir, GetTickCount(), InterlockedIncrement(&s_stagingCounter));
-    EnsureDirW(stagingDir);
-
-    wchar_t errMsg[512] = L"";
-    BOOL extractOk = isZip
-        ? ExtractZipToDirW(filePath, stagingDir, errMsg)
-        : ExtractRarToDirW(filePath, stagingDir, errMsg);
-
-    if (!extractOk) {
-        MessageBoxW(hwnd, errMsg[0] ? errMsg : L"Extraction failed.",
-            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
-        DeleteDirectoryRecursiveW(stagingDir);
-        return;
-    }
-
-    wchar_t archiveBase[MAX_PATH];
-    GetArchiveBaseName(filePath, archiveBase);
-
-    wchar_t finalPath[MAX_PATH];
-    BOOL finalizeOk = FinalizeIntoPackFolder(stagingDir, destPackDir, archiveBase, finalPath);
-
-    DeleteDirectoryRecursiveW(stagingDir);
-
-    if (!finalizeOk) {
-        MessageBoxW(hwnd, L"Extracted, but couldn't move the mod into place.",
-            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
-        return;
-    }
-
-    wchar_t msg[600];
-    wsprintfW(msg, L"Mod installed to:\n%s", finalPath);
-    MessageBoxW(hwnd, msg, L"The Choicer Voicer - Launcher", MB_ICONINFORMATION | MB_OK);
-}
-
 /* ===================== HTTP download (WinINet) ===================== */
 
-static BYTE* HttpGetToMemory(const wchar_t* url, DWORD* outSize, wchar_t* errMsg)
+typedef void (*HttpProgressFn)(DWORD downloaded, DWORD total, void* userData);
+
+static BYTE* HttpGetToMemoryEx(const wchar_t* url, DWORD* outSize, wchar_t* errMsg,
+                                HttpProgressFn onProgress, void* progressUserData)
 {
     HINTERNET hInternet = InternetOpenW(L"ChoicerVoicerLauncher/1.0",
         INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
@@ -987,6 +970,16 @@ static BYTE* HttpGetToMemory(const wchar_t* url, DWORD* outSize, wchar_t* errMsg
         wsprintfW(errMsg, L"Couldn't connect to:\n%s", url);
         InternetCloseHandle(hInternet);
         return NULL;
+    }
+
+    /* best-effort - if the server doesn't report Content-Length (e.g.
+       chunked transfer), this just stays 0 and callers fall back to an
+       indeterminate/byte-count progress display instead of a percentage */
+    DWORD totalSize = 0;
+    DWORD totalSizeLen = sizeof(totalSize);
+    if (!HttpQueryInfoW(hUrl, HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+            &totalSize, &totalSizeLen, NULL)) {
+        totalSize = 0;
     }
 
     DWORD capacity = 1 << 20;
@@ -1017,6 +1010,7 @@ static BYTE* HttpGetToMemory(const wchar_t* url, DWORD* outSize, wchar_t* errMsg
         DWORD readBytes = 0;
         if (!InternetReadFile(hUrl, buf + size, avail, &readBytes) || readBytes == 0) break;
         size += readBytes;
+        if (onProgress) onProgress(size, totalSize, progressUserData);
         if (size > 500u * 1024u * 1024u) break; /* 500MB safety cap */
     }
 
@@ -1031,6 +1025,11 @@ static BYTE* HttpGetToMemory(const wchar_t* url, DWORD* outSize, wchar_t* errMsg
 
     *outSize = size;
     return buf;
+}
+
+static BYTE* HttpGetToMemory(const wchar_t* url, DWORD* outSize, wchar_t* errMsg)
+{
+    return HttpGetToMemoryEx(url, outSize, errMsg, NULL, NULL);
 }
 
 /* ===================== GameBanana link resolution ===================== */
@@ -1121,90 +1120,1118 @@ static int SniffArchiveType(const BYTE* data, DWORD size)
     return 0;
 }
 
-/* ===================== dropped-URL entry point (GameBanana link or direct file link) ===================== */
+/* ===================== install pipeline: download/extract/install with
+   a progress window, used by both the drop zone and the mod browser's
+   Install button ===================== */
 
-static void ProcessDroppedURL(HWND hwnd, const wchar_t* url)
+/* forward declaration - defined further down near WM_CREATE/theme
+   handling, but needed here by the progress/destination-picker popups */
+static void ApplyDarkTitlebar(HWND hwnd, BOOL dark);
+
+#define WM_APP_INSTALL_PROGRESS (WM_APP + 2)
+#define WM_APP_INSTALL_DONE     (WM_APP + 3)
+
+#define ID_DESTPICKER_COMBO   6001
+#define ID_DESTPICKER_INSTALL 6002
+#define ID_DESTPICKER_CANCEL  6003
+
+typedef struct {
+    wchar_t status[128];
+    int percent; /* -1 = indeterminate */
+} InstallProgressMsg;
+
+typedef struct {
+    BOOL success;
+    wchar_t resultMsg[600];
+} InstallDoneMsg;
+
+typedef struct {
+    HWND mainWnd;
+    HWND progressWnd;
+    BOOL fromUrl;
+    wchar_t url[2048];
+    wchar_t localFile[MAX_PATH];
+    wchar_t destPackFolder[64];
+} InstallJobParam;
+
+static HWND g_hInstallProgressWnd = NULL;
+static HWND g_hInstallProgressBar = NULL;
+static HWND g_hInstallProgressLabel = NULL;
+static HWND g_hInstallProgressOwner = NULL;
+
+static void GetCurrentPackFolder(wchar_t* out, int outCap)
 {
-    wchar_t downloadUrl[2048];
-    wchar_t itemType[32], itemId[32];
-
-    if (IsGameBananaModPageUrl(url, itemType, itemId)) {
-        wchar_t apiUrl[1024];
-        wsprintfW(apiUrl,
-            L"https://api.gamebanana.com/Core/Item/Data?itemtype=%s&itemid=%s&fields=Files().aFiles()&format=json_min",
-            itemType, itemId);
-
-        wchar_t errMsg[512] = L"";
-        DWORD apiSize = 0;
-        BYTE* apiData = HttpGetToMemory(apiUrl, &apiSize, errMsg);
-        if (!apiData) {
-            MessageBoxW(hwnd, errMsg[0] ? errMsg : L"Couldn't reach GameBanana's API.",
-                L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
-            return;
-        }
-
-        char* jsonText = (char*)malloc((size_t)apiSize + 1);
-        if (!jsonText) { free(apiData); return; }
-        memcpy(jsonText, apiData, apiSize);
-        jsonText[apiSize] = 0;
-        free(apiData);
-
-        wchar_t fileId[64];
-        BOOL found = ExtractFirstJsonNumericKey(jsonText, fileId);
-        free(jsonText);
-
-        if (!found) {
-            MessageBoxW(hwnd, L"Couldn't find a downloadable file on that GameBanana page.",
-                L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
-            return;
-        }
-
-        wsprintfW(downloadUrl, L"https://gamebanana.com/dl/%s", fileId);
-    } else {
-        wcsncpy(downloadUrl, url, 2047);
-        downloadUrl[2047] = 0;
-    }
-
-    wchar_t errMsg2[512] = L"";
-    DWORD fileSize = 0;
-    BYTE* fileData = HttpGetToMemory(downloadUrl, &fileSize, errMsg2);
-    if (!fileData) {
-        MessageBoxW(hwnd, errMsg2[0] ? errMsg2 : L"Download failed.",
-            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
-        return;
-    }
-
-    int archiveType = SniffArchiveType(fileData, fileSize);
-    if (archiveType == 0) {
-        free(fileData);
-        MessageBoxW(hwnd, L"The downloaded file doesn't look like a .zip or .rar archive.",
-            L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
-        return;
-    }
-
-    wchar_t tempDir[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempDir);
-    wchar_t tempFile[MAX_PATH];
-    wsprintfW(tempFile, L"%scvlauncher_dl_%lu.%s", tempDir, GetTickCount(),
-        archiveType == 1 ? L"zip" : L"rar");
-
-    HANDLE hOut = CreateFileW(tempFile, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hOut == INVALID_HANDLE_VALUE) {
-        free(fileData);
-        MessageBoxW(hwnd, L"Couldn't save the downloaded file.",
-            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
-        return;
-    }
-    DWORD written = 0;
-    WriteFile(hOut, fileData, fileSize, &written, NULL);
-    CloseHandle(hOut);
-    free(fileData);
-
-    ProcessDroppedFile(hwnd, tempFile);
-    DeleteFileW(tempFile);
+    int sel = (int)SendMessageW(g_hPackCombo, CB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= NUM_PACK_FOLDERS) sel = 0;
+    wcsncpy(out, PACK_FOLDERS[sel], outCap - 1);
+    out[outCap - 1] = 0;
 }
 
-/* ===================== OLE drag & drop (files AND dragged links) ===================== */
+static void PostInstallProgress(HWND progressWnd, const wchar_t* status, int percent)
+{
+    if (!IsWindow(progressWnd)) return;
+    InstallProgressMsg* p = (InstallProgressMsg*)malloc(sizeof(InstallProgressMsg));
+    if (!p) return;
+    wcsncpy(p->status, status, 127); p->status[127] = 0;
+    p->percent = percent;
+    if (!PostMessageW(progressWnd, WM_APP_INSTALL_PROGRESS, 0, (LPARAM)p)) free(p);
+}
+
+typedef struct { HWND progressWnd; DWORD lastPercentPosted; } DlProgressCtx;
+
+static void DownloadProgressCb(DWORD downloaded, DWORD total, void* userData)
+{
+    DlProgressCtx* ctx = (DlProgressCtx*)userData;
+    wchar_t status[128];
+    if (total > 0) {
+        DWORD pct = (DWORD)(((double)downloaded / (double)total) * 100.0);
+        if (pct > 100) pct = 100;
+        if (pct == ctx->lastPercentPosted) return;
+        ctx->lastPercentPosted = pct;
+        wsprintfW(status, L"Downloading\u2026 %lu%%", pct);
+        PostInstallProgress(ctx->progressWnd, status, (int)pct);
+    } else {
+        wsprintfW(status, L"Downloading\u2026 %lu KB", downloaded / 1024);
+        PostInstallProgress(ctx->progressWnd, status, -1);
+    }
+}
+
+static DWORD WINAPI InstallJobThreadProc(LPVOID lpParam)
+{
+    InstallJobParam* job = (InstallJobParam*)lpParam;
+    HWND progressWnd = job->progressWnd;
+
+    InstallDoneMsg* done = (InstallDoneMsg*)calloc(1, sizeof(InstallDoneMsg));
+    if (!done) { free(job); return 0; }
+
+    wchar_t filePath[MAX_PATH] = L"";
+    BOOL ownsTempFile = FALSE;
+
+    if (job->fromUrl) {
+        wchar_t downloadUrl[2048];
+        wchar_t itemType[32], itemId[32];
+
+        if (IsGameBananaModPageUrl(job->url, itemType, itemId)) {
+            PostInstallProgress(progressWnd, L"Looking up download link\u2026", -1);
+            wchar_t apiUrl[1024];
+            wsprintfW(apiUrl,
+                L"https://api.gamebanana.com/Core/Item/Data?itemtype=%s&itemid=%s&fields=Files().aFiles()&format=json_min",
+                itemType, itemId);
+            wchar_t errMsg[512] = L"";
+            DWORD apiSize = 0;
+            BYTE* apiData = HttpGetToMemoryEx(apiUrl, &apiSize, errMsg, NULL, NULL);
+            if (!apiData) {
+                done->success = FALSE;
+                wcsncpy(done->resultMsg, errMsg[0] ? errMsg : L"Couldn't reach GameBanana's API.", 599);
+                goto finish;
+            }
+            char* jsonText = (char*)malloc((size_t)apiSize + 1);
+            if (!jsonText) {
+                free(apiData);
+                done->success = FALSE;
+                wcscpy(done->resultMsg, L"Out of memory.");
+                goto finish;
+            }
+            memcpy(jsonText, apiData, apiSize); jsonText[apiSize] = 0;
+            free(apiData);
+            wchar_t fileId[64];
+            BOOL found = ExtractFirstJsonNumericKey(jsonText, fileId);
+            free(jsonText);
+            if (!found) {
+                done->success = FALSE;
+                wcscpy(done->resultMsg, L"Couldn't find a downloadable file on that GameBanana page.");
+                goto finish;
+            }
+            wsprintfW(downloadUrl, L"https://gamebanana.com/dl/%s", fileId);
+        } else {
+            wcsncpy(downloadUrl, job->url, 2047); downloadUrl[2047] = 0;
+        }
+
+        DlProgressCtx ctx = { progressWnd, (DWORD)-1 };
+        wchar_t errMsg2[512] = L"";
+        DWORD fileSize = 0;
+        BYTE* fileData = HttpGetToMemoryEx(downloadUrl, &fileSize, errMsg2, DownloadProgressCb, &ctx);
+        if (!fileData) {
+            done->success = FALSE;
+            wcsncpy(done->resultMsg, errMsg2[0] ? errMsg2 : L"Download failed.", 599);
+            goto finish;
+        }
+
+        int archiveType = SniffArchiveType(fileData, fileSize);
+        if (archiveType == 0) {
+            free(fileData);
+            done->success = FALSE;
+            wcscpy(done->resultMsg, L"The downloaded file doesn't look like a .zip or .rar archive.");
+            goto finish;
+        }
+
+        wchar_t tempDir[MAX_PATH];
+        GetTempPathW(MAX_PATH, tempDir);
+        wsprintfW(filePath, L"%scvlauncher_dl_%lu.%s", tempDir, GetTickCount(),
+            archiveType == 1 ? L"zip" : L"rar");
+        HANDLE hOut = CreateFileW(filePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hOut == INVALID_HANDLE_VALUE) {
+            free(fileData);
+            done->success = FALSE;
+            wcscpy(done->resultMsg, L"Couldn't save the downloaded file.");
+            goto finish;
+        }
+        DWORD written = 0;
+        WriteFile(hOut, fileData, fileSize, &written, NULL);
+        CloseHandle(hOut);
+        free(fileData);
+        ownsTempFile = TRUE;
+    } else {
+        wcsncpy(filePath, job->localFile, MAX_PATH - 1);
+        filePath[MAX_PATH - 1] = 0;
+    }
+
+    {
+        size_t len = wcslen(filePath);
+        BOOL isZip = (len > 4 && _wcsicmp(filePath + len - 4, L".zip") == 0);
+        BOOL isRar = (len > 4 && _wcsicmp(filePath + len - 4, L".rar") == 0);
+        if (!isZip && !isRar) {
+            done->success = FALSE;
+            wcscpy(done->resultMsg, L"Only .zip and .rar files are supported.");
+            goto finish;
+        }
+
+        PostInstallProgress(progressWnd, L"Preparing\u2026", -1);
+        wchar_t gameDir[MAX_PATH];
+        if (!GetAppDataGameDir(gameDir) || !PathIsDirW(gameDir)) {
+            done->success = FALSE;
+            wsprintfW(done->resultMsg,
+                L"The game's data folder doesn't exist yet:\n%s\n\nRun the game at least once first.", gameDir);
+            goto finish;
+        }
+
+        wchar_t destPackDir[MAX_PATH];
+        wsprintfW(destPackDir, L"%s\\%s", gameDir, job->destPackFolder);
+        EnsureDirW(destPackDir);
+
+        wchar_t tempDir2[MAX_PATH];
+        GetTempPathW(MAX_PATH, tempDir2);
+        wchar_t stagingDir[MAX_PATH];
+        static LONG s_stagingCounter = 0;
+        wsprintfW(stagingDir, L"%scvlauncher_staging_%lu_%ld",
+            tempDir2, GetTickCount(), InterlockedIncrement(&s_stagingCounter));
+        EnsureDirW(stagingDir);
+
+        PostInstallProgress(progressWnd, L"Extracting\u2026", -1);
+        wchar_t errMsg3[512] = L"";
+        BOOL extractOk = isZip
+            ? ExtractZipToDirW(filePath, stagingDir, errMsg3)
+            : ExtractRarToDirW(filePath, stagingDir, errMsg3);
+
+        if (!extractOk) {
+            done->success = FALSE;
+            wcsncpy(done->resultMsg, errMsg3[0] ? errMsg3 : L"Extraction failed.", 599);
+            DeleteDirectoryRecursiveW(stagingDir);
+            goto finish;
+        }
+
+        wchar_t archiveBase[MAX_PATH];
+        GetArchiveBaseName(filePath, archiveBase);
+
+        wchar_t finalPath[MAX_PATH];
+        PostInstallProgress(progressWnd, L"Installing\u2026", -1);
+        BOOL finalizeOk = FinalizeIntoPackFolder(stagingDir, destPackDir, archiveBase, finalPath);
+        DeleteDirectoryRecursiveW(stagingDir);
+
+        if (!finalizeOk) {
+            done->success = FALSE;
+            wcscpy(done->resultMsg, L"Extracted, but couldn't move the mod into place.");
+            goto finish;
+        }
+
+        done->success = TRUE;
+        wsprintfW(done->resultMsg, L"Mod installed to:\n%s", finalPath);
+    }
+
+finish:
+    if (ownsTempFile && filePath[0]) DeleteFileW(filePath);
+    free(job);
+    if (IsWindow(progressWnd)) {
+        PostMessageW(progressWnd, WM_APP_INSTALL_DONE, 0, (LPARAM)done);
+    } else {
+        free(done);
+    }
+    return 0;
+}
+
+static LRESULT CALLBACK InstallProgressWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH b = CreateSolidBrush(g_darkMode ? COLOR_DARK_BG : COLOR_LIGHT_BG);
+        FillRect(hdc, &rc, b);
+        DeleteObject(b);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_darkMode ? COLOR_DARK_TEXT : COLOR_LIGHT_TEXT);
+        return (LRESULT)(g_hBrushBg ? g_hBrushBg : GetSysColorBrush(COLOR_BTNFACE));
+    }
+    case WM_APP_INSTALL_PROGRESS: {
+        InstallProgressMsg* p = (InstallProgressMsg*)lParam;
+        if (p) {
+            if (g_hInstallProgressLabel) SetWindowTextW(g_hInstallProgressLabel, p->status);
+            if (g_hInstallProgressBar) {
+                if (p->percent < 0) {
+                    SendMessageW(g_hInstallProgressBar, PBM_SETMARQUEE, TRUE, 50);
+                } else {
+                    SendMessageW(g_hInstallProgressBar, PBM_SETMARQUEE, FALSE, 0);
+                    SendMessageW(g_hInstallProgressBar, PBM_SETPOS, (WPARAM)p->percent, 0);
+                }
+            }
+            free(p);
+        }
+        return 0;
+    }
+    case WM_APP_INSTALL_DONE: {
+        InstallDoneMsg* d = (InstallDoneMsg*)lParam;
+        HWND owner = g_hInstallProgressOwner;
+        g_hInstallProgressWnd = NULL;
+        g_hInstallProgressBar = NULL;
+        g_hInstallProgressLabel = NULL;
+        DestroyWindow(hwnd);
+        if (owner) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
+        if (d) {
+            MessageBoxW(owner, d->resultMsg, L"The Choicer Voicer - Launcher",
+                d->success ? (MB_ICONINFORMATION | MB_OK) : (MB_ICONERROR | MB_OK));
+            free(d);
+        }
+        return 0;
+    }
+    case WM_CLOSE:
+        /* no cancel support yet - ignore attempts to close mid-install */
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static HWND CreateInstallProgressWnd(HWND hOwner, HINSTANCE hInst)
+{
+    static BOOL classRegistered = FALSE;
+    const wchar_t CLASS_NAME[] = L"CVLauncherInstallProgressWnd";
+    if (!classRegistered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc   = InstallProgressWndProc;
+        wc.hInstance     = hInst;
+        wc.lpszClassName = CLASS_NAME;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL;
+        wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
+        RegisterClassW(&wc);
+        classRegistered = TRUE;
+    }
+
+    const int w = 360, h = 130;
+    DWORD style = WS_POPUP | WS_CAPTION;
+    RECT rc = {0, 0, w, h};
+    AdjustWindowRect(&rc, style, FALSE);
+    int winW = rc.right - rc.left, winH = rc.bottom - rc.top;
+
+    RECT prc; GetWindowRect(hOwner, &prc);
+    int posX = prc.left + ((prc.right - prc.left) - winW) / 2;
+    int posY = prc.top + ((prc.bottom - prc.top) - winH) / 2;
+
+    g_hInstallProgressOwner = hOwner;
+
+    HWND hPop = CreateWindowExW(WS_EX_DLGMODALFRAME, CLASS_NAME, L"Installing Mod\u2026",
+        style, posX, posY, winW, winH, hOwner, NULL, hInst, NULL);
+    if (!hPop) return NULL;
+    g_hInstallProgressWnd = hPop;
+    ApplyDarkTitlebar(hPop, g_darkMode);
+
+    g_hInstallProgressLabel = CreateWindowW(L"STATIC", L"Starting\u2026",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 20, w - 40, 20, hPop, NULL, hInst, NULL);
+    SendMessageW(g_hInstallProgressLabel, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    g_hInstallProgressBar = CreateWindowW(PROGRESS_CLASSW, NULL,
+        WS_CHILD | WS_VISIBLE | PBS_SMOOTH | PBS_MARQUEE, 20, 50, w - 40, 22, hPop, NULL, hInst, NULL);
+    SendMessageW(g_hInstallProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 100));
+    SendMessageW(g_hInstallProgressBar, PBM_SETMARQUEE, TRUE, 50);
+
+    EnableWindow(hOwner, FALSE);
+    ShowWindow(hPop, SW_SHOW);
+    UpdateWindow(hPop);
+    return hPop;
+}
+
+static void StartInstallJob(HWND mainWnd, BOOL fromUrl, const wchar_t* urlOrPath, const wchar_t* destPackFolder)
+{
+    HWND progressWnd = CreateInstallProgressWnd(mainWnd, g_hInstance);
+    if (!progressWnd) {
+        MessageBoxW(mainWnd, L"Couldn't open the progress window.",
+            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
+        return;
+    }
+
+    InstallJobParam* job = (InstallJobParam*)calloc(1, sizeof(InstallJobParam));
+    if (!job) { DestroyWindow(progressWnd); return; }
+    job->mainWnd = mainWnd;
+    job->progressWnd = progressWnd;
+    job->fromUrl = fromUrl;
+    if (fromUrl) { wcsncpy(job->url, urlOrPath, 2047); job->url[2047] = 0; }
+    else { wcsncpy(job->localFile, urlOrPath, MAX_PATH - 1); job->localFile[MAX_PATH - 1] = 0; }
+    wcsncpy(job->destPackFolder, destPackFolder, 63); job->destPackFolder[63] = 0;
+
+    HANDLE hThread = CreateThread(NULL, 0, InstallJobThreadProc, job, 0, NULL);
+    if (hThread) CloseHandle(hThread);
+    else { free(job); DestroyWindow(progressWnd); }
+}
+
+/* ---- destination picker: which pack_### folder to install a mod-browser
+   pick into, shown before StartInstallJob runs ---- */
+
+static wchar_t g_destPickerUrl[2048] = L"";
+static HWND g_hDestPickerCombo = NULL;
+static HWND g_hDestPickerOwner = NULL;
+
+static void CloseDestPicker(HWND hwnd, BOOL doInstall)
+{
+    wchar_t chosen[64] = L"";
+    if (doInstall && g_hDestPickerCombo) {
+        int sel = (int)SendMessageW(g_hDestPickerCombo, CB_GETCURSEL, 0, 0);
+        if (sel < 0 || sel >= NUM_PACK_FOLDERS) sel = 0;
+        wcsncpy(chosen, PACK_FOLDERS[sel], 63);
+    }
+    HWND owner = g_hDestPickerOwner;
+    DestroyWindow(hwnd);
+    if (owner) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
+    if (doInstall && chosen[0]) {
+        wcsncpy(g_lastPackFolder, chosen, 63); g_lastPackFolder[63] = 0;
+        SaveSettings();
+        if (g_hPackCombo) {
+            LRESULT idx = SendMessageW(g_hPackCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)chosen);
+            if (idx != CB_ERR) SendMessageW(g_hPackCombo, CB_SETCURSEL, (WPARAM)idx, 0);
+        }
+        StartInstallJob(owner, TRUE, g_destPickerUrl, chosen);
+    }
+}
+
+static LRESULT CALLBACK DestPickerWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH b = CreateSolidBrush(g_darkMode ? COLOR_DARK_BG : COLOR_LIGHT_BG);
+        FillRect(hdc, &rc, b);
+        DeleteObject(b);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_darkMode ? COLOR_DARK_TEXT : COLOR_LIGHT_TEXT);
+        return (LRESULT)(g_hBrushBg ? g_hBrushBg : GetSysColorBrush(COLOR_BTNFACE));
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_DESTPICKER_INSTALL: CloseDestPicker(hwnd, TRUE); return 0;
+        case ID_DESTPICKER_CANCEL:  CloseDestPicker(hwnd, FALSE); return 0;
+        }
+        break;
+    case WM_CLOSE:
+        CloseDestPicker(hwnd, FALSE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowDestPicker(HWND hOwner, HINSTANCE hInst, const wchar_t* profileUrl)
+{
+    wcsncpy(g_destPickerUrl, profileUrl, 2047); g_destPickerUrl[2047] = 0;
+
+    static BOOL classRegistered = FALSE;
+    const wchar_t CLASS_NAME[] = L"CVLauncherDestPickerWnd";
+    if (!classRegistered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc   = DestPickerWndProc;
+        wc.hInstance     = hInst;
+        wc.lpszClassName = CLASS_NAME;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL;
+        wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
+        RegisterClassW(&wc);
+        classRegistered = TRUE;
+    }
+
+    const int w = 340, h = 170;
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT rc = {0, 0, w, h};
+    AdjustWindowRect(&rc, style, FALSE);
+    int winW = rc.right - rc.left, winH = rc.bottom - rc.top;
+
+    RECT prc; GetWindowRect(hOwner, &prc);
+    int posX = prc.left + ((prc.right - prc.left) - winW) / 2;
+    int posY = prc.top + ((prc.bottom - prc.top) - winH) / 2;
+
+    g_hDestPickerOwner = hOwner;
+
+    HWND hPop = CreateWindowExW(WS_EX_DLGMODALFRAME, CLASS_NAME, L"Choose Destination",
+        style, posX, posY, winW, winH, hOwner, NULL, hInst, NULL);
+    if (!hPop) return;
+    ApplyDarkTitlebar(hPop, g_darkMode);
+
+    HWND hMsg = CreateWindowW(L"STATIC", L"Install this mod to which pack folder?",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 20, w - 40, 20, hPop, NULL, hInst, NULL);
+    SendMessageW(hMsg, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    g_hDestPickerCombo = CreateWindowW(L"COMBOBOX", NULL,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+        20, 46, w - 40, 200, hPop, (HMENU)(INT_PTR)ID_DESTPICKER_COMBO, hInst, NULL);
+    SendMessageW(g_hDestPickerCombo, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+    for (int i = 0; i < NUM_PACK_FOLDERS; i++) {
+        SendMessageW(g_hDestPickerCombo, CB_ADDSTRING, 0, (LPARAM)PACK_FOLDERS[i]);
+    }
+    {
+        LRESULT idx = g_lastPackFolder[0]
+            ? SendMessageW(g_hDestPickerCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)g_lastPackFolder)
+            : CB_ERR;
+        SendMessageW(g_hDestPickerCombo, CB_SETCURSEL, (idx == CB_ERR) ? 0 : (WPARAM)idx, 0);
+    }
+    SetWindowTheme(g_hDestPickerCombo, g_darkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+
+    HWND hInstallBtn = CreateWindowW(L"BUTTON", L"Install",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+        20, h - 60, 140, 32, hPop, (HMENU)(INT_PTR)ID_DESTPICKER_INSTALL, hInst, NULL);
+    SendMessageW(hInstallBtn, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    HWND hCancelBtn = CreateWindowW(L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        w - 20 - 100, h - 60, 100, 32, hPop, (HMENU)(INT_PTR)ID_DESTPICKER_CANCEL, hInst, NULL);
+    SendMessageW(hCancelBtn, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    EnableWindow(hOwner, FALSE);
+    ShowWindow(hPop, SW_SHOW);
+    UpdateWindow(hPop);
+    SetForegroundWindow(hPop);
+    SetFocus(g_hDestPickerCombo);
+}
+
+/* ===================== GameBanana mod browser (Browse Mods tab) ===================== */
+
+/* ---- tiny bounded JSON scanner - not a general parser, just enough to
+   pull the handful of fields we need out of GameBanana's Mod/Index
+   response without pulling in a JSON library ---- */
+
+static const char* FindSubstrBounded(const char* start, const char* end, const char* needle)
+{
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || start >= end) return NULL;
+    for (const char* p = start; p + (ptrdiff_t)nlen <= end; p++) {
+        size_t k = 0;
+        while (k < nlen && p[k] == needle[k]) k++;
+        if (k == nlen) return p;
+    }
+    return NULL;
+}
+
+/* p is positioned anywhere before the object's opening '{' (skipping over
+   things like a preceding ':' or '[' is fine); matches braces while
+   ignoring anything inside quoted strings, bounded by `end`. */
+static BOOL SpanJsonObjectAfterColon(const char* p, const char* end, const char** outStart, const char** outEnd)
+{
+    while (p < end && *p != '{') {
+        if (*p == '}' || *p == ']') return FALSE;
+        p++;
+    }
+    if (p >= end || *p != '{') return FALSE;
+    const char* start = p;
+    int depth = 0;
+    BOOL inStr = FALSE;
+    for (; p < end; p++) {
+        char c = *p;
+        if (inStr) {
+            if (c == '\\') { p++; continue; }
+            if (c == '"') inStr = FALSE;
+            continue;
+        }
+        if (c == '"') { inStr = TRUE; continue; }
+        if (c == '{') depth++;
+        else if (c == '}') {
+            depth--;
+            if (depth == 0) { *outStart = start; *outEnd = p + 1; return TRUE; }
+        }
+    }
+    return FALSE;
+}
+
+/* advances *pp past the next object found before `end`; returns FALSE once
+   the enclosing array's ']' is reached (or on malformed input) */
+static BOOL NextJsonArrayObject(const char** pp, const char* end, const char** outStart, const char** outEnd)
+{
+    const char* p = *pp;
+    while (p < end && *p != '{' && *p != ']') p++;
+    if (p >= end || *p == ']') { *pp = p; return FALSE; }
+    if (!SpanJsonObjectAfterColon(p, end, outStart, outEnd)) { *pp = end; return FALSE; }
+    *pp = *outEnd;
+    return TRUE;
+}
+
+static BOOL ExtractJsonIntAt(const char* p, const char* end, long* outVal)
+{
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    BOOL neg = FALSE;
+    if (p < end && *p == '-') { neg = TRUE; p++; }
+    if (p >= end || *p < '0' || *p > '9') return FALSE;
+    long v = 0;
+    while (p < end && *p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+    *outVal = neg ? -v : v;
+    return TRUE;
+}
+
+/* p points at the opening quote of a JSON string value. Resolves the
+   handful of escapes GameBanana's API actually uses (including \uXXXX)
+   into literal UTF-8 bytes, then reuses the settings-file UTF-8 decoder
+   to get a proper wide string - handles both escaped and raw non-ASCII
+   text correctly instead of a naive byte-for-byte copy. */
+static void ExtractJsonStringAt(const char* p, const char* end, wchar_t* out, int outCap)
+{
+    out[0] = 0;
+    /* GameBanana's API returns pretty-printed JSON with a space after each
+       colon (e.g. `"_sName": "Some Mod"`), not compact JSON - this was
+       being missed here (ExtractJsonIntAt already skips leading
+       whitespace, this didn't), so the strict "must be a quote right
+       here" check below was silently bailing out on every string field:
+       names, author names, and thumbnail URLs were all coming back
+       empty because of this one missing skip. */
+    while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= end || *p != '"') return;
+    p++;
+
+    char utf8buf[1024];
+    int oi = 0;
+    while (p < end && *p != '"' && oi < (int)sizeof(utf8buf) - 4) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '\\' && p + 1 < end) {
+            char e = p[1];
+            switch (e) {
+            case '"':  utf8buf[oi++] = '"';  p += 2; break;
+            case '\\': utf8buf[oi++] = '\\'; p += 2; break;
+            case '/':  utf8buf[oi++] = '/';  p += 2; break;
+            case 'n':  utf8buf[oi++] = '\n'; p += 2; break;
+            case 't':  utf8buf[oi++] = '\t'; p += 2; break;
+            case 'u':
+                if (p + 5 < end) {
+                    unsigned int code = 0;
+                    for (int k = 0; k < 4; k++) {
+                        char hc = p[2 + k];
+                        int v = (hc >= '0' && hc <= '9') ? hc - '0' :
+                                (hc >= 'a' && hc <= 'f') ? hc - 'a' + 10 :
+                                (hc >= 'A' && hc <= 'F') ? hc - 'A' + 10 : 0;
+                        code = (code << 4) | (unsigned)v;
+                    }
+                    if (code < 0x80) {
+                        utf8buf[oi++] = (char)code;
+                    } else if (code < 0x800) {
+                        utf8buf[oi++] = (char)(0xC0 | (code >> 6));
+                        utf8buf[oi++] = (char)(0x80 | (code & 0x3F));
+                    } else {
+                        utf8buf[oi++] = (char)(0xE0 | (code >> 12));
+                        utf8buf[oi++] = (char)(0x80 | ((code >> 6) & 0x3F));
+                        utf8buf[oi++] = (char)(0x80 | (code & 0x3F));
+                    }
+                    p += 6;
+                } else { p++; }
+                break;
+            default: utf8buf[oi++] = e; p += 2; break;
+            }
+        } else {
+            utf8buf[oi++] = (char)c;
+            p++;
+        }
+    }
+    DecodeUtf8ToWideBuf((const BYTE*)utf8buf, (DWORD)oi, out, outCap);
+}
+
+/* ---- decoding JPG/PNG thumbnails via WIC (Windows Imaging Component) ----
+   this app has no bundled image codec (miniz is a zip library only), so
+   thumbnails are decoded through the OS's own WIC COM service instead of
+   pulling in a third-party decoder. */
+static HBITMAP DecodeImageToBitmap(IWICImagingFactory* pFactory, const BYTE* data, DWORD size)
+{
+    if (!pFactory || !data || size == 0) return NULL;
+
+    HBITMAP hBmp = NULL;
+    IWICStream* pStream = NULL;
+    IWICBitmapDecoder* pDecoder = NULL;
+    IWICBitmapFrameDecode* pFrame = NULL;
+    IWICFormatConverter* pConverter = NULL;
+
+    HRESULT hr = pFactory->lpVtbl->CreateStream(pFactory, &pStream);
+    if (SUCCEEDED(hr)) hr = pStream->lpVtbl->InitializeFromMemory(pStream, (BYTE*)data, size);
+    if (SUCCEEDED(hr)) {
+        hr = pFactory->lpVtbl->CreateDecoderFromStream(pFactory, (IStream*)pStream, NULL,
+            WICDecodeMetadataCacheOnDemand, &pDecoder);
+    }
+    if (SUCCEEDED(hr)) hr = pDecoder->lpVtbl->GetFrame(pDecoder, 0, &pFrame);
+    if (SUCCEEDED(hr)) hr = pFactory->lpVtbl->CreateFormatConverter(pFactory, &pConverter);
+    if (SUCCEEDED(hr)) {
+        hr = pConverter->lpVtbl->Initialize(pConverter, (IWICBitmapSource*)pFrame,
+            &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
+    }
+
+    UINT w = 0, h = 0;
+    if (SUCCEEDED(hr)) hr = pConverter->lpVtbl->GetSize(pConverter, &w, &h);
+
+    if (SUCCEEDED(hr) && w > 0 && h > 0) {
+        BITMAPINFO bmi; memset(&bmi, 0, sizeof(bmi));
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = (LONG)w;
+        bmi.bmiHeader.biHeight = -(LONG)h; /* top-down, matches WIC's row order */
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        void* bits = NULL;
+        hBmp = CreateDIBSection(NULL, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+        if (hBmp && bits) {
+            UINT stride = w * 4;
+            hr = pConverter->lpVtbl->CopyPixels(pConverter, NULL, stride, stride * h, (BYTE*)bits);
+            if (FAILED(hr)) { DeleteObject(hBmp); hBmp = NULL; }
+        }
+    }
+
+    if (pConverter) pConverter->lpVtbl->Release(pConverter);
+    if (pFrame) pFrame->lpVtbl->Release(pFrame);
+    if (pDecoder) pDecoder->lpVtbl->Release(pDecoder);
+    if (pStream) pStream->lpVtbl->Release(pStream);
+    return hBmp;
+}
+
+/* ---- mod list state (populated on a background thread, only ever read/
+   written on the UI thread once handed over via WM_APP_MODS_LOADED) ---- */
+
+#define MODS_PER_PAGE 20
+#define MAX_MOD_ENTRIES 200
+#define WM_APP_MODS_LOADED    (WM_APP + 1)
+
+typedef struct {
+    long modId;
+    wchar_t name[128];
+    wchar_t author[64];
+    wchar_t category[64];
+    wchar_t profileUrl[160];
+    long likeCount;
+    long viewCount;
+    long dateAdded;
+    HBITMAP thumb;
+} ModEntry;
+
+typedef enum { MODLOAD_IDLE, MODLOAD_LOADING, MODLOAD_LOADED, MODLOAD_ERROR } ModLoadState;
+
+static ModEntry g_modEntries[MAX_MOD_ENTRIES];
+static int g_modCount = 0;
+static int g_modNextPage = 1;
+static ModLoadState g_modLoadState = MODLOAD_IDLE;
+static wchar_t g_modErrorMsg[256] = L"";
+static BOOL g_modHasMore = TRUE;
+static int g_modScrollY = 0;
+static HWND g_hModListWnd = NULL;
+
+/* real page tabs (Prev/1/2/3.../Next) instead of an easy-to-miss "Load
+   more mods..." text link - each "page" here is MODLIST_PAGE_SIZE mods
+   out of the current search/sort results, not a raw GameBanana page (see
+   MOD_FETCH_RAW_PERPAGE/MOD_FETCH_MAX_RAW_PAGES below for that). Clicking
+   Next past the last already-loaded page triggers fetching another batch
+   and automatically advances onto it once it arrives. */
+#define MODLIST_PAGE_SIZE 20
+static int g_modCurrentPage = 0;      /* 0-indexed, into the filtered/sorted results */
+static BOOL g_modPendingAdvance = FALSE;
+
+/* search + sort. GameBanana's Mod/Index _sSort rejected the whole
+   request outright for values it doesn't recognize (confirmed via the
+   literal "_sErrorCode":"UNKNOWN_SORT" error it returned, per BUILD.txt)
+   - but real captured browser requests confirmed apiv13 + Generic_Category
+   + _sSort=Generic_MostViewed AND _sSort=Generic_MostLiked as both
+   genuinely working, so Likes and Views now trigger a real server-side
+   fetch in that order (see ModSortServerValue) rather than only
+   reordering whatever happened to already be cached. Newest and Name
+   still have no confirmed server equivalent (Newest is just the default
+   fetch order with _sSort omitted, and Name isn't a GameBanana concept
+   at all), so those two stay a pure client-side resort of g_modEntries.
+   Search is a separate endpoint (Util/Search/Results) with its own real
+   captured request/response, wired in separately - see StartModFetch. */
+typedef enum { MODSORT_NEWEST = 0, MODSORT_NAME, MODSORT_LIKES, MODSORT_VIEWS } ModSortMode;
+static ModSortMode g_modSortMode = MODSORT_NEWEST;
+static wchar_t g_modSearchQuery[128] = L"";
+static int g_modFilteredIndices[MAX_MOD_ENTRIES];
+static int g_modFilteredCount = 0;
+static HWND g_hModSearchEdit = NULL;
+static HWND g_hModSortCombo = NULL;
+
+#define ID_MODLIST_SEARCH 5010
+#define ID_MODLIST_SORT   5011
+#define MODLIST_SEARCH_DEBOUNCE_TIMER_ID 2
+#define MODLIST_SEARCH_DEBOUNCE_MS 450
+
+/* result handed from the worker thread to the UI thread */
+typedef struct {
+    ModEntry* entries;
+    int count;
+    BOOL hasMore;
+    BOOL ok;
+    wchar_t errMsg[256];
+} ModFetchResult;
+
+typedef struct { HWND hwnd; int page; ModSortMode sortMode; wchar_t searchQuery[128]; } ModFetchThreadParam;
+
+/* Both confirmed directly against real captured browser requests (apiv13,
+   Mod/Index, _aFilters[Generic_Category]=44064) - one with
+   _sSort=Generic_MostViewed, one with _sSort=Generic_MostLiked, each
+   returning correctly-ordered, correctly-scoped results. MODSORT_NEWEST
+   and MODSORT_NAME return NULL (omit _sSort entirely), since the
+   confirmed default behavior with no _sSort at all is newest-first, and
+   NAME has no known server-side equivalent - it stays a pure
+   client-side resort of whatever's loaded. */
+static const wchar_t* ModSortServerValue(ModSortMode mode)
+{
+    switch (mode) {
+    case MODSORT_LIKES: return L"Generic_MostLiked";
+    case MODSORT_VIEWS: return L"Generic_MostViewed";
+    case MODSORT_NEWEST:
+    case MODSORT_NAME:
+    default: return NULL;
+    }
+}
+
+static void FreeModFetchResult(ModFetchResult* r)
+{
+    if (!r) return;
+    if (r->entries) {
+        for (int i = 0; i < r->count; i++) {
+            if (r->entries[i].thumb) DeleteObject(r->entries[i].thumb);
+        }
+        free(r->entries);
+    }
+    free(r);
+}
+
+/* Two real captured requests (both against _aFilters[Generic_Category]
+   with different _sSort values) came back with every single record - 30
+   for 30 across both - correctly belonging to our game. So unlike
+   _aFilters[Generic_Game], which never reliably scoped results in
+   testing, filtering by GAMEBANANA_CATEGORY_ID actually works. The
+   client-side _aGame._idRow check right below is kept anyway as a cheap
+   safety net (costs nothing, guards against the rare edge case), but
+   this should no longer need to hunt through many pages to fill a
+   batch - a modest budget is kept mainly as protection against an
+   unexpectedly sparse result set, not because filtering is expected to
+   fail outright the way it used to be assumed to. */
+#define MOD_FETCH_RAW_PERPAGE 50
+#define MOD_FETCH_MAX_RAW_PAGES 6
+
+/* Minimal query-string encoder for search terms: letters/digits/-_.~ pass
+   through, spaces become +, other ASCII punctuation is percent-encoded.
+   Non-ASCII characters are dropped rather than UTF-8-percent-encoded -
+   search terms here are expected to be plain ASCII in practice, and this
+   keeps the encoder simple. */
+static void UrlEncodeSearchQuery(const wchar_t* src, wchar_t* out, int outCap)
+{
+    static const wchar_t hex[] = L"0123456789ABCDEF";
+    int oi = 0;
+    for (const wchar_t* p = src; *p && oi < outCap - 4; p++) {
+        wchar_t c = *p;
+        if ((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') ||
+            c == L'-' || c == L'_' || c == L'.' || c == L'~') {
+            out[oi++] = c;
+        } else if (c == L' ') {
+            out[oi++] = L'+';
+        } else if (c < 128) {
+            out[oi++] = L'%';
+            out[oi++] = hex[(c >> 4) & 0xF];
+            out[oi++] = hex[c & 0xF];
+        }
+    }
+    out[oi] = 0;
+}
+
+static DWORD WINAPI ModBrowserFetchThreadProc(LPVOID lpParam)
+{
+    ModFetchThreadParam* tp = (ModFetchThreadParam*)lpParam;
+    HWND targetWnd = tp->hwnd;
+    int page = tp->page;
+    ModSortMode sortMode = tp->sortMode;
+    wchar_t searchQuery[128];
+    wcscpy(searchQuery, tp->searchQuery);
+    free(tp);
+
+    BOOL isSearch = (searchQuery[0] != 0);
+    wchar_t searchQueryEncoded[384] = L"";
+    if (isSearch) UrlEncodeSearchQuery(searchQuery, searchQueryEncoded, 384);
+
+    ModFetchResult* result = (ModFetchResult*)calloc(1, sizeof(ModFetchResult));
+    if (!result) return 0;
+
+    HRESULT coHr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
+    IWICImagingFactory* pFactory = NULL;
+    CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
+        &IID_IWICImagingFactory, (void**)&pFactory);
+
+    ModEntry* entries = (ModEntry*)calloc(MODS_PER_PAGE, sizeof(ModEntry));
+    int count = 0;
+    int pagesChecked = 0;
+    BOOL anyFetchOk = FALSE;
+    BOOL rawPageWasFull = TRUE; /* becomes FALSE once a raw page comes back short, meaning no more data */
+    wchar_t lastErr[256] = L"";
+    const wchar_t* sortParam = ModSortServerValue(sortMode);
+
+    while (entries && count < MODS_PER_PAGE && pagesChecked < MOD_FETCH_MAX_RAW_PAGES && rawPageWasFull) {
+        if (pagesChecked > 0) Sleep(200); /* be a reasonable API citizen across a multi-page scan */
+
+        wchar_t apiUrl[768];
+        if (isSearch) {
+            /* Confirmed against a real captured browser request AND
+               response: apiv13's Util/Search/Results, with _idGameRow/
+               _sSearchString/_sOrder/_csvFields. The response confirmed
+               _idGameRow genuinely filters correctly - 15 for 15 records
+               in the captured response belonged to our game, even with
+               the search string left as placeholder text - so unlike
+               Mod/Index's old Generic_Game filter, this one has real
+               evidence behind it, not just hope. Only _sOrder=best_match
+               is confirmed - the current sort mode isn't applied while a
+               search is active, since I don't have confirmed _sOrder
+               values beyond that one. Results mix every submission type
+               (Mod, Wip, Sound, Thread, ...), filtered below to
+               _sModelName=="Mod" only. */
+            wsprintfW(apiUrl,
+                L"https://gamebanana.com/apiv13/Util/Search/Results?_sOrder=best_match&_idGameRow=%ld&_sSearchString=%s"
+                L"&_csvFields=name%%2Cdescription%%2Carticle%%2Cattribs%%2Cstudio%%2Cowner%%2Ccredits&_nPage=%d",
+                GAMEBANANA_GAME_ID, searchQueryEncoded, page);
+        } else if (sortParam) {
+            wsprintfW(apiUrl,
+                L"https://gamebanana.com/apiv13/Mod/Index?_nPage=%d&_nPerpage=%d&_aFilters%%5BGeneric_Category%%5D=%ld&_sSort=%s",
+                page, MOD_FETCH_RAW_PERPAGE, GAMEBANANA_CATEGORY_ID, sortParam);
+        } else {
+            wsprintfW(apiUrl,
+                L"https://gamebanana.com/apiv13/Mod/Index?_nPage=%d&_nPerpage=%d&_aFilters%%5BGeneric_Category%%5D=%ld",
+                page, MOD_FETCH_RAW_PERPAGE, GAMEBANANA_CATEGORY_ID);
+        }
+
+        wchar_t errMsg[256] = L"";
+        DWORD jsonSize = 0;
+        BYTE* jsonData = HttpGetToMemory(apiUrl, &jsonSize, errMsg);
+        pagesChecked++;
+        page++;
+        if (!jsonData) {
+            wcsncpy(lastErr, errMsg[0] ? errMsg : L"Couldn't reach GameBanana.", 255);
+            continue; /* could be transient - keep trying the next page */
+        }
+
+        char* json = (char*)malloc((size_t)jsonSize + 1);
+        if (!json) { free(jsonData); wcscpy(lastErr, L"Out of memory."); break; }
+        memcpy(json, jsonData, jsonSize);
+        json[jsonSize] = 0;
+        free(jsonData);
+        const char* jsonEnd = json + jsonSize;
+
+        const char* recPos = FindSubstrBounded(json, jsonEnd, "\"_aRecords\"");
+        if (!recPos) {
+            /* not real JSON we recognize (e.g. an error/block page) - show
+               a snippet of whatever actually came back so this is
+               diagnosable from the on-screen message, without needing a
+               separate debug build */
+            wchar_t snippet[181] = L"";
+            int snippetBytes = (jsonSize < 140) ? (int)jsonSize : 140;
+            int wn = MultiByteToWideChar(CP_UTF8, 0, json, snippetBytes, snippet, 180);
+            if (wn <= 0) wn = MultiByteToWideChar(CP_ACP, 0, json, snippetBytes, snippet, 180);
+            if (wn > 0) snippet[wn] = 0; else snippet[0] = 0;
+            for (wchar_t* p = snippet; *p; p++) {
+                if (*p == L'\r' || *p == L'\n' || *p == L'\t') *p = L' ';
+            }
+
+            if (snippet[0]) {
+                wsprintfW(lastErr, L"GameBanana returned something unexpected:\n%s", snippet);
+            } else {
+                wcscpy(lastErr, L"GameBanana returned something unexpected (empty/unreadable response).");
+            }
+            free(json);
+            break;
+        }
+        anyFetchOk = TRUE;
+
+        recPos += strlen("\"_aRecords\"");
+        while (recPos < jsonEnd && *recPos != '[') recPos++;
+        if (recPos < jsonEnd) recPos++;
+
+        int recordsOnThisPage = 0;
+        const char* recStart; const char* recEnd;
+        while (NextJsonArrayObject(&recPos, jsonEnd, &recStart, &recEnd)) {
+            recordsOnThisPage++;
+            /* Once this fetch's batch is full, keep scanning the rest of
+               THIS page just to get an accurate count for rawPageWasFull
+               below, but skip the expensive per-match work (thumbnail
+               download included) - otherwise recordsOnThisPage reflects
+               only however many records happened to precede the 20th
+               match, which is almost never the page's true size, and
+               rawPageWasFull/hasMore ends up wrong on nearly every fetch. */
+            if (count >= MODS_PER_PAGE) continue;
+
+            long idRow = 0;
+            const char* idPos = FindSubstrBounded(recStart, recEnd, "\"_idRow\":");
+            if (!idPos || !ExtractJsonIntAt(idPos + 9, recEnd, &idRow)) continue;
+
+            /* client-side safety net: only keep mods for our configured
+               game, regardless of whether the server-side filter above
+               actually took effect - this is what makes the paging loop
+               above necessary in the first place */
+            long gameId = -1;
+            const char* gamePos = FindSubstrBounded(recStart, recEnd, "\"_aGame\":");
+            if (gamePos) {
+                const char* gs; const char* ge;
+                if (SpanJsonObjectAfterColon(gamePos + 9, recEnd, &gs, &ge)) {
+                    const char* gidPos = FindSubstrBounded(gs, ge, "\"_idRow\":");
+                    if (gidPos) ExtractJsonIntAt(gidPos + 9, ge, &gameId);
+                }
+            }
+            if (gameId != GAMEBANANA_GAME_ID) continue;
+
+            /* Mod/Index only ever returns Mod-type records anyway, but
+               Util/Search/Results mixes in Wips/Sounds/Threads/Requests/
+               etc. - this launcher only installs Mod-type submissions, so
+               filter to that regardless of which endpoint this came from. */
+            char modelName[16] = {0};
+            const char* modelPos = FindSubstrBounded(recStart, recEnd, "\"_sModelName\":");
+            if (modelPos) {
+                const char* mp = modelPos + 14;
+                while (mp < recEnd && (*mp == ' ' || *mp == '\t')) mp++;
+                if (mp < recEnd && *mp == '"') {
+                    mp++;
+                    int mi = 0;
+                    while (mp < recEnd && *mp != '"' && mi < 15) modelName[mi++] = *mp++;
+                    modelName[mi] = 0;
+                }
+            }
+            if (modelName[0] && strcmp(modelName, "Mod") != 0) continue;
+
+            ModEntry ne; memset(&ne, 0, sizeof(ne));
+            ne.modId = idRow;
+            wsprintfW(ne.profileUrl, L"https://gamebanana.com/mods/%ld", idRow);
+
+            const char* namePos = FindSubstrBounded(recStart, recEnd, "\"_sName\":");
+            if (namePos) ExtractJsonStringAt(namePos + 9, recEnd, ne.name, 128);
+            if (!ne.name[0]) wcscpy(ne.name, L"(untitled)");
+
+            const char* subPos = FindSubstrBounded(recStart, recEnd, "\"_aSubmitter\":");
+            if (subPos) {
+                const char* ss; const char* se;
+                if (SpanJsonObjectAfterColon(subPos + 14, recEnd, &ss, &se)) {
+                    const char* snamePos = FindSubstrBounded(ss, se, "\"_sName\":");
+                    if (snamePos) ExtractJsonStringAt(snamePos + 9, se, ne.author, 64);
+                }
+            }
+            if (!ne.author[0]) wcscpy(ne.author, L"Unknown");
+
+            const char* catPos = FindSubstrBounded(recStart, recEnd, "\"_aRootCategory\":");
+            if (catPos) {
+                const char* cs; const char* ce;
+                if (SpanJsonObjectAfterColon(catPos + strlen("\"_aRootCategory\":"), recEnd, &cs, &ce)) {
+                    const char* cnamePos = FindSubstrBounded(cs, ce, "\"_sName\":");
+                    if (cnamePos) ExtractJsonStringAt(cnamePos + strlen("\"_sName\":"), ce, ne.category, 64);
+                }
+            }
+
+            const char* likePos = FindSubstrBounded(recStart, recEnd, "\"_nLikeCount\":");
+            if (likePos) ExtractJsonIntAt(likePos + strlen("\"_nLikeCount\":"), recEnd, &ne.likeCount);
+            const char* viewPos = FindSubstrBounded(recStart, recEnd, "\"_nViewCount\":");
+            if (viewPos) ExtractJsonIntAt(viewPos + strlen("\"_nViewCount\":"), recEnd, &ne.viewCount);
+            const char* datePos = FindSubstrBounded(recStart, recEnd, "\"_tsDateAdded\":");
+            if (datePos) ExtractJsonIntAt(datePos + strlen("\"_tsDateAdded\":"), recEnd, &ne.dateAdded);
+
+            wchar_t thumbUrl[512] = L"";
+            const char* contentPos = FindSubstrBounded(recStart, recEnd, "\"_aPreviewContent\":");
+            if (contentPos) {
+                const char* cs; const char* ce;
+                if (SpanJsonObjectAfterColon(contentPos + 19, recEnd, &cs, &ce)) {
+                    const char* ssPos = FindSubstrBounded(cs, ce, "\"screenshot\":");
+                    if (ssPos) {
+                        const char* ss; const char* se;
+                        if (SpanJsonObjectAfterColon(ssPos + 13, ce, &ss, &se)) {
+                            wchar_t baseUrl[256] = L"", file220[128] = L"";
+                            const char* basePos = FindSubstrBounded(ss, se, "\"_sBaseUrl\":");
+                            if (basePos) ExtractJsonStringAt(basePos + 12, se, baseUrl, 256);
+                            const char* filePos = FindSubstrBounded(ss, se, "\"_sFile220\":");
+                            if (filePos) ExtractJsonStringAt(filePos + 12, se, file220, 128);
+                            if (baseUrl[0] && file220[0]) wsprintfW(thumbUrl, L"%s/%s", baseUrl, file220);
+                        }
+                    }
+                }
+            }
+
+            if (thumbUrl[0] && pFactory) {
+                wchar_t imgErr[256] = L"";
+                DWORD imgSize = 0;
+                BYTE* imgData = HttpGetToMemory(thumbUrl, &imgSize, imgErr);
+                if (imgData) {
+                    ne.thumb = DecodeImageToBitmap(pFactory, imgData, imgSize);
+                    free(imgData);
+                }
+            }
+
+            entries[count++] = ne;
+        }
+
+        free(json);
+        rawPageWasFull = (recordsOnThisPage >= MOD_FETCH_RAW_PERPAGE);
+    }
+
+    if (pFactory) pFactory->lpVtbl->Release(pFactory);
+
+    /* ok means "the fetch itself worked", independent of whether any
+       matches were found - that distinction now reaches the UI instead of
+       both cases showing the same "no mods found" text */
+    result->ok = anyFetchOk;
+    if (!anyFetchOk) {
+        wcsncpy(result->errMsg, lastErr[0] ? lastErr : L"Couldn't reach GameBanana.", 255);
+    }
+    result->entries = entries;
+    result->count = count;
+    result->hasMore = rawPageWasFull; /* more raw pages may still exist beyond where this stopped */
+
+    if (coHr == S_OK || coHr == S_FALSE) CoUninitialize();
+
+    if (IsWindow(targetWnd)) {
+        PostMessageW(targetWnd, WM_APP_MODS_LOADED, (WPARAM)page, (LPARAM)result);
+    } else {
+        FreeModFetchResult(result);
+    }
+    return 0;
+}
+
+static void StartModFetch(HWND listWnd, int page, ModSortMode sortMode, const wchar_t* searchQuery)
+{
+    g_modLoadState = MODLOAD_LOADING;
+    ModFetchThreadParam* tp = (ModFetchThreadParam*)malloc(sizeof(ModFetchThreadParam));
+    if (!tp) {
+        g_modLoadState = (g_modCount == 0) ? MODLOAD_ERROR : MODLOAD_LOADED;
+        if (g_modCount > 0) g_modHasMore = TRUE;
+        wcscpy(g_modErrorMsg, L"Out of memory.");
+        return;
+    }
+    tp->hwnd = listWnd;
+    tp->page = page;
+    tp->sortMode = sortMode;
+    wcsncpy(tp->searchQuery, searchQuery ? searchQuery : L"", 127);
+    tp->searchQuery[127] = 0;
+    HANDLE hThread = CreateThread(NULL, 0, ModBrowserFetchThreadProc, tp, 0, NULL);
+    if (hThread) {
+        CloseHandle(hThread);
+    } else {
+        free(tp);
+        g_modLoadState = (g_modCount == 0) ? MODLOAD_ERROR : MODLOAD_LOADED;
+        if (g_modCount > 0) g_modHasMore = TRUE;
+        wcscpy(g_modErrorMsg, L"Couldn't start the download.");
+    }
+}
 
 typedef struct DropTargetImpl {
     IDropTarget base;   /* must be first member */
@@ -1290,7 +2317,9 @@ static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget* this_, IDataObject* pDataO
             for (UINT i = 0; i < count; i++) {
                 wchar_t path[MAX_PATH];
                 if (DragQueryFileW(hDrop, i, path, MAX_PATH)) {
-                    ProcessDroppedFile(self->hwnd, path);
+                    wchar_t destFolder[64];
+                    GetCurrentPackFolder(destFolder, 64);
+                    StartInstallJob(self->hwnd, FALSE, path, destFolder);
                 }
             }
             GlobalUnlock(stg.hGlobal);
@@ -1314,7 +2343,9 @@ static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget* this_, IDataObject* pDataO
             while (len > 0 && (url[len-1]=='\r'||url[len-1]=='\n'||url[len-1]==' '||url[len-1]=='\t')) url[--len]=0;
 
             if (_wcsnicmp(url, L"http://", 7) == 0 || _wcsnicmp(url, L"https://", 8) == 0) {
-                ProcessDroppedURL(self->hwnd, url);
+                wchar_t destFolder[64];
+                GetCurrentPackFolder(destFolder, 64);
+                StartInstallJob(self->hwnd, TRUE, url, destFolder);
             } else {
                 MessageBoxW(self->hwnd, L"That doesn't look like a web link.",
                     L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
@@ -1361,7 +2392,7 @@ static void ApplyThemeColors(HWND hwnd)
     if (g_hNormalCombo) SetWindowTheme(g_hNormalCombo, comboTheme, NULL);
     if (g_hCompatCombo) SetWindowTheme(g_hCompatCombo, comboTheme, NULL);
     if (g_hPackCombo)   SetWindowTheme(g_hPackCombo, comboTheme, NULL);
-    if (g_hDarkModeCheck) SetWindowTheme(g_hDarkModeCheck, comboTheme, NULL);
+    if (g_hModSortCombo) SetWindowTheme(g_hModSortCombo, comboTheme, NULL);
 
     RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
@@ -1441,17 +2472,653 @@ static HWND MakeGroupBox(HWND parent, HINSTANCE hInst, const wchar_t* text,
         x + 10, y + 6, w - 20, 20, parent, NULL, hInst, NULL);
     if (font) SendMessageW(title, WM_SETFONT, (WPARAM)font, TRUE);
 
+    /* MakeGroupBox is only ever used for the two Launcher-tab mode cards,
+       so it's safe to always track both of its windows for tab-switching */
+    TrackLauncherPageWnd(panel);
+    TrackLauncherPageWnd(title);
+
     return panel;
 }
 
-static HWND MakeCheckbox(HWND parent, HINSTANCE hInst, const wchar_t* text,
-                          int x, int y, int w, int ht, int id, HFONT font)
+/* ===================== Browse Mods tab: scrollable mod list window ===================== */
+
+#define MODLIST_ROW_H     84
+#define MODLIST_THUMB     64
+#define MODLIST_PAD       10
+#define MODLIST_BTN_W     90
+#define MODLIST_BTN_H     30
+#define MODLIST_HEADER_H  40
+#define MODLIST_PAGEBAR_H 44
+#define MODLIST_PAGEBTN_W 32
+#define MODLIST_PAGEBTN_H 26
+
+static RECT ModListInstallBtnRect(RECT clientRc, int rowScreenY)
 {
-    HWND ctl = CreateWindowW(L"BUTTON", text,
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        x, y, w, ht, parent, (HMENU)(INT_PTR)id, hInst, NULL);
-    if (font) SendMessageW(ctl, WM_SETFONT, (WPARAM)font, TRUE);
-    return ctl;
+    RECT r;
+    r.right = clientRc.right - MODLIST_PAD;
+    r.left = r.right - MODLIST_BTN_W;
+    r.top = rowScreenY + (MODLIST_ROW_H - MODLIST_BTN_H) / 2;
+    r.bottom = r.top + MODLIST_BTN_H;
+    return r;
+}
+
+/* shared geometry for the page bar (Prev / 1 2 3... / Next) at the
+   bottom of the list - computed once, used identically by both painting
+   and click hit-testing so they can never disagree */
+typedef struct {
+    RECT prevRc;
+    RECT nextRc;
+    RECT pageRc[7];
+    int pageNum[7];
+    int visibleCount;
+    int totalPages;
+} PagebarLayout;
+
+static void ComputePagebarLayout(RECT clientRc, PagebarLayout* out)
+{
+    memset(out, 0, sizeof(*out));
+    int totalPages = (g_modFilteredCount + MODLIST_PAGE_SIZE - 1) / MODLIST_PAGE_SIZE;
+    if (totalPages < 1) totalPages = 1;
+    out->totalPages = totalPages;
+
+    int maxSlots = 7;
+    if (maxSlots > totalPages) maxSlots = totalPages;
+    int startPage = g_modCurrentPage - maxSlots / 2;
+    if (startPage < 0) startPage = 0;
+    if (startPage + maxSlots > totalPages) startPage = totalPages - maxSlots;
+    if (startPage < 0) startPage = 0;
+    out->visibleCount = maxSlots;
+
+    int barTop = clientRc.bottom - MODLIST_PAGEBAR_H;
+    int barMidY = barTop + MODLIST_PAGEBAR_H / 2;
+    int btnGap = 4;
+    int totalBtnsWidth = maxSlots * MODLIST_PAGEBTN_W + (maxSlots > 0 ? (maxSlots - 1) * btnGap : 0);
+    int centerX = clientRc.right / 2;
+    int firstX = centerX - totalBtnsWidth / 2;
+
+    for (int i = 0; i < maxSlots; i++) {
+        int x = firstX + i * (MODLIST_PAGEBTN_W + btnGap);
+        RECT r = { x, barMidY - MODLIST_PAGEBTN_H / 2, x + MODLIST_PAGEBTN_W, barMidY + MODLIST_PAGEBTN_H / 2 };
+        out->pageRc[i] = r;
+        out->pageNum[i] = startPage + i;
+    }
+
+    RECT prev = { firstX - MODLIST_PAD - 60, barMidY - MODLIST_PAGEBTN_H / 2,
+                  firstX - MODLIST_PAD, barMidY + MODLIST_PAGEBTN_H / 2 };
+    out->prevRc = prev;
+
+    int lastX = firstX + (maxSlots > 0 ? maxSlots * (MODLIST_PAGEBTN_W + btnGap) : 0);
+    RECT next = { lastX + MODLIST_PAD, barMidY - MODLIST_PAGEBTN_H / 2,
+                  lastX + MODLIST_PAD + 60, barMidY + MODLIST_PAGEBTN_H / 2 };
+    out->nextRc = next;
+}
+
+static void ModListDoInstall(HWND listWnd, int index)
+{
+    if (index < 0 || index >= g_modCount) return;
+    HWND mainWnd = GetParent(listWnd);
+    ShowDestPicker(mainWnd, g_hInstance, g_modEntries[index].profileUrl);
+}
+
+static BOOL WStrContainsCI(const wchar_t* haystack, const wchar_t* needle)
+{
+    if (!needle || !needle[0]) return TRUE;
+    size_t hn = wcslen(haystack), nn = wcslen(needle);
+    if (nn > hn) return FALSE;
+    for (size_t i = 0; i + nn <= hn; i++) {
+        size_t j = 0;
+        while (j < nn && towlower(haystack[i + j]) == towlower(needle[j])) j++;
+        if (j == nn) return TRUE;
+    }
+    return FALSE;
+}
+
+static ModSortMode g_modSortModeForCompare = MODSORT_NEWEST;
+
+static int ModEntryCompare(const void* a, const void* b)
+{
+    const ModEntry* ea = (const ModEntry*)a;
+    const ModEntry* eb = (const ModEntry*)b;
+    switch (g_modSortModeForCompare) {
+    case MODSORT_NAME:
+        return _wcsicmp(ea->name, eb->name);
+    case MODSORT_LIKES:
+        if (eb->likeCount != ea->likeCount) return (eb->likeCount > ea->likeCount) ? 1 : -1;
+        return 0;
+    case MODSORT_VIEWS:
+        if (eb->viewCount != ea->viewCount) return (eb->viewCount > ea->viewCount) ? 1 : -1;
+        return 0;
+    case MODSORT_NEWEST:
+    default:
+        if (eb->dateAdded > ea->dateAdded) return 1;
+        if (eb->dateAdded < ea->dateAdded) return -1;
+        return 0;
+    }
+}
+
+/* re-sorts g_modEntries in place per g_modSortMode and rebuilds
+   g_modFilteredIndices per g_modSearchQuery - called any time entries are
+   added, the search text changes, or the sort mode changes */
+static void RebuildModListView(void)
+{
+    g_modSortModeForCompare = g_modSortMode;
+    if (g_modCount > 0) qsort(g_modEntries, (size_t)g_modCount, sizeof(ModEntry), ModEntryCompare);
+
+    g_modFilteredCount = 0;
+    for (int i = 0; i < g_modCount; i++) {
+        ModEntry* e = &g_modEntries[i];
+        /* When a search is active, what's cached was already fetched via
+           a server-side Util/Search/Results query (see StartModFetch/
+           WM_TIMER) - re-checking name/author/category here could reject
+           genuine matches the server found via description/tags/other
+           fields this client-side check doesn't look at. Only re-filter
+           locally when there's no active search (plain browse mode). */
+        BOOL matches = (g_modSearchQuery[0] != 0) ? TRUE
+                     : (WStrContainsCI(e->name, g_modSearchQuery)
+                     || WStrContainsCI(e->author, g_modSearchQuery)
+                     || WStrContainsCI(e->category, g_modSearchQuery));
+        if (matches && g_modFilteredCount < MAX_MOD_ENTRIES) {
+            g_modFilteredIndices[g_modFilteredCount++] = i;
+        }
+    }
+
+    int totalPages = (g_modFilteredCount + MODLIST_PAGE_SIZE - 1) / MODLIST_PAGE_SIZE;
+    if (totalPages < 1) totalPages = 1;
+
+    if (g_modPendingAdvance && g_modCurrentPage + 1 < totalPages) {
+        g_modCurrentPage++;
+        g_modPendingAdvance = FALSE;
+    }
+    if (g_modCurrentPage >= totalPages) g_modCurrentPage = totalPages - 1;
+    if (g_modCurrentPage < 0) g_modCurrentPage = 0;
+
+    if (g_hModListWnd) {
+        int pageStart = g_modCurrentPage * MODLIST_PAGE_SIZE;
+        int pageEnd = pageStart + MODLIST_PAGE_SIZE;
+        if (pageEnd > g_modFilteredCount) pageEnd = g_modFilteredCount;
+        int rowsOnPage = pageEnd - pageStart;
+        if (rowsOnPage < 0) rowsOnPage = 0;
+
+        RECT rc; GetClientRect(g_hModListWnd, &rc);
+        int totalH = MODLIST_HEADER_H + rowsOnPage * MODLIST_ROW_H;
+        int visibleH = rc.bottom - MODLIST_PAGEBAR_H;
+        int maxScroll = totalH - visibleH;
+        if (maxScroll < 0) maxScroll = 0;
+        if (g_modScrollY > maxScroll) g_modScrollY = maxScroll;
+        if (g_modScrollY < 0) g_modScrollY = 0;
+    }
+}
+
+static LRESULT CALLBACK ModListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hInst = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+
+        g_hModSearchEdit = CreateWindowW(L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            10, 8, 300, 24, hwnd, (HMENU)(INT_PTR)ID_MODLIST_SEARCH, hInst, NULL);
+        SendMessageW(g_hModSearchEdit, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+        g_hModSortCombo = CreateWindowW(L"COMBOBOX", NULL,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+            320, 8, 220, 200, hwnd, (HMENU)(INT_PTR)ID_MODLIST_SORT, hInst, NULL);
+        SendMessageW(g_hModSortCombo, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+        SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Newest");
+        SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Name (A-Z)");
+        SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Most Liked");
+        SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Most Viewed");
+        SendMessageW(g_hModSortCombo, CB_SETCURSEL, (WPARAM)g_modSortMode, 0);
+        SetWindowTheme(g_hModSortCombo, g_darkMode ? L"DarkMode_Explorer" : L"Explorer", NULL);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+
+        HBRUSH bg = CreateSolidBrush(g_darkMode ? COLOR_DARK_BG : COLOR_LIGHT_BG);
+        FillRect(hdc, &rc, bg);
+        DeleteObject(bg);
+
+        SetBkMode(hdc, TRANSPARENT);
+        COLORREF textColor = g_darkMode ? COLOR_DARK_TEXT : COLOR_LIGHT_TEXT;
+
+        int contentBottom = rc.bottom - MODLIST_PAGEBAR_H;
+        int pageStart = g_modCurrentPage * MODLIST_PAGE_SIZE;
+        int pageEnd = pageStart + MODLIST_PAGE_SIZE;
+        if (pageEnd > g_modFilteredCount) pageEnd = g_modFilteredCount;
+
+        HDC memDC = CreateCompatibleDC(hdc);
+
+        for (int i = pageStart; i < pageEnd; i++) {
+            int ri = i - pageStart;
+            int y = MODLIST_HEADER_H + ri * MODLIST_ROW_H - g_modScrollY;
+            if (y + MODLIST_ROW_H < MODLIST_HEADER_H || y > contentBottom) continue;
+
+            ModEntry* e = &g_modEntries[g_modFilteredIndices[i]];
+            RECT thumbRc = { MODLIST_PAD, y + MODLIST_PAD,
+                              MODLIST_PAD + MODLIST_THUMB, y + MODLIST_PAD + MODLIST_THUMB };
+            if (e->thumb) {
+                HGDIOBJ oldBmp = SelectObject(memDC, e->thumb);
+                BITMAP bm; GetObjectW(e->thumb, sizeof(bm), &bm);
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, NULL);
+                StretchBlt(hdc, thumbRc.left, thumbRc.top, MODLIST_THUMB, MODLIST_THUMB,
+                    memDC, 0, 0, bm.bmWidth, bm.bmHeight, SRCCOPY);
+                SelectObject(memDC, oldBmp);
+            } else {
+                HBRUSH ph = CreateSolidBrush(g_darkMode ? COLOR_DARK_PANEL : COLOR_LIGHT_PANEL);
+                FillRect(hdc, &thumbRc, ph);
+                DeleteObject(ph);
+            }
+            HPEN pen = CreatePen(PS_SOLID, 1, textColor);
+            HGDIOBJ oldPen = SelectObject(hdc, pen);
+            HGDIOBJ oldBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, thumbRc.left, thumbRc.top, thumbRc.right, thumbRc.bottom);
+            SelectObject(hdc, oldBrush);
+            SelectObject(hdc, oldPen);
+            DeleteObject(pen);
+
+            RECT textRc = { thumbRc.right + MODLIST_PAD, y + MODLIST_PAD,
+                             rc.right - MODLIST_PAD - MODLIST_BTN_W - MODLIST_PAD, y + MODLIST_PAD + 20 };
+            SetTextColor(hdc, textColor);
+            HGDIOBJ oldFont = SelectObject(hdc, g_fontRegular);
+            DrawTextW(hdc, e->name, -1, &textRc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            RECT authorRc = textRc;
+            authorRc.top += 22; authorRc.bottom += 22;
+            wchar_t byLine[160];
+            wsprintfW(byLine, L"by %s", e->author);
+            SelectObject(hdc, g_fontSmall);
+            DrawTextW(hdc, byLine, -1, &authorRc, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+            /* mod type/category (Mod Packs, Hosts, Dub Mode, Skins, etc.) */
+            RECT catRc = authorRc;
+            catRc.top += 18; catRc.bottom += 18;
+            DrawTextW(hdc, e->category[0] ? e->category : L"Mod", -1, &catRc,
+                DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+            SelectObject(hdc, oldFont);
+
+            RECT btnRc = ModListInstallBtnRect(rc, y);
+            HBRUSH btnBrush = CreateSolidBrush(g_darkMode ? COLOR_DARK_PANEL : COLOR_LIGHT_PANEL);
+            FillRect(hdc, &btnRc, btnBrush);
+            DeleteObject(btnBrush);
+            HPEN btnPen = CreatePen(PS_SOLID, 1, textColor);
+            HGDIOBJ oldBtnPen = SelectObject(hdc, btnPen);
+            HGDIOBJ oldBtnBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            Rectangle(hdc, btnRc.left, btnRc.top, btnRc.right, btnRc.bottom);
+            SelectObject(hdc, oldBtnBrush);
+            SelectObject(hdc, oldBtnPen);
+            DeleteObject(btnPen);
+            SelectObject(hdc, g_fontRegular);
+            DrawTextW(hdc, L"Install", -1, &btnRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            HPEN sepPen = CreatePen(PS_SOLID, 1, g_darkMode ? RGB(60, 60, 60) : RGB(220, 220, 220));
+            HGDIOBJ oldSepPen = SelectObject(hdc, sepPen);
+            MoveToEx(hdc, MODLIST_PAD, y, NULL);
+            LineTo(hdc, rc.right - MODLIST_PAD, y);
+            SelectObject(hdc, oldSepPen);
+            DeleteObject(sepPen);
+        }
+
+        DeleteDC(memDC);
+
+        /* empty-state messaging, drawn in the row area (not the page bar) */
+        if (g_modLoadState != MODLOAD_LOADING && g_modLoadState != MODLOAD_ERROR) {
+            RECT emptyRc = { 0, MODLIST_HEADER_H, rc.right, contentBottom };
+            SetTextColor(hdc, textColor);
+            SelectObject(hdc, g_fontRegular);
+            if (g_modCount == 0) {
+                DrawTextW(hdc, L"No mods found for this game yet.", -1, &emptyRc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            } else if (g_modFilteredCount == 0) {
+                DrawTextW(hdc, L"No mods match your search.", -1, &emptyRc,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+
+        /* page bar - fixed at the bottom, not part of the scrolling area */
+        RECT barRc = { 0, contentBottom, rc.right, rc.bottom };
+        HBRUSH barBg = CreateSolidBrush(g_darkMode ? COLOR_DARK_PANEL : COLOR_LIGHT_PANEL);
+        FillRect(hdc, &barRc, barBg);
+        DeleteObject(barBg);
+        HPEN barLinePen = CreatePen(PS_SOLID, 1, g_darkMode ? RGB(60, 60, 60) : RGB(220, 220, 220));
+        HGDIOBJ oldBarLinePen = SelectObject(hdc, barLinePen);
+        MoveToEx(hdc, 0, contentBottom, NULL);
+        LineTo(hdc, rc.right, contentBottom);
+        SelectObject(hdc, oldBarLinePen);
+        DeleteObject(barLinePen);
+
+        SetTextColor(hdc, textColor);
+        SelectObject(hdc, g_fontRegular);
+
+        if (g_modLoadState == MODLOAD_LOADING) {
+            DrawTextW(hdc, L"Loading mods\u2026", -1, &barRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else if (g_modLoadState == MODLOAD_ERROR) {
+            wchar_t msg[320];
+            wsprintfW(msg, L"%s  (click to retry)", g_modErrorMsg);
+            DrawTextW(hdc, msg, -1, &barRc, DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+        } else {
+            PagebarLayout lay;
+            ComputePagebarLayout(rc, &lay);
+            BOOL canPrev = (g_modCurrentPage > 0);
+            BOOL canNext = (g_modCurrentPage + 1 < lay.totalPages) || g_modHasMore;
+
+            HPEN ctrlPen = CreatePen(PS_SOLID, 1, textColor);
+            HGDIOBJ oldCtrlPen = SelectObject(hdc, ctrlPen);
+            HGDIOBJ oldCtrlBrush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+
+            SetTextColor(hdc, canPrev ? textColor : RGB(140, 140, 140));
+            Rectangle(hdc, lay.prevRc.left, lay.prevRc.top, lay.prevRc.right, lay.prevRc.bottom);
+            DrawTextW(hdc, L"< Prev", -1, &lay.prevRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            for (int i = 0; i < lay.visibleCount; i++) {
+                BOOL isCurrent = (lay.pageNum[i] == g_modCurrentPage);
+                if (isCurrent) {
+                    HBRUSH curBg = CreateSolidBrush(g_darkMode ? COLOR_DARK_BG : COLOR_LIGHT_BG);
+                    FillRect(hdc, &lay.pageRc[i], curBg);
+                    DeleteObject(curBg);
+                }
+                SetTextColor(hdc, textColor);
+                Rectangle(hdc, lay.pageRc[i].left, lay.pageRc[i].top, lay.pageRc[i].right, lay.pageRc[i].bottom);
+                wchar_t num[8];
+                wsprintfW(num, L"%d", lay.pageNum[i] + 1);
+                DrawTextW(hdc, num, -1, &lay.pageRc[i], DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+
+            SetTextColor(hdc, canNext ? textColor : RGB(140, 140, 140));
+            Rectangle(hdc, lay.nextRc.left, lay.nextRc.top, lay.nextRc.right, lay.nextRc.bottom);
+            DrawTextW(hdc, L"Next >", -1, &lay.nextRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(hdc, oldCtrlBrush);
+            SelectObject(hdc, oldCtrlPen);
+            DeleteObject(ctrlPen);
+        }
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_LBUTTONDOWN: {
+        int mouseX = GET_X_LPARAM(lParam);
+        int mouseY = GET_Y_LPARAM(lParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        int contentBottom = rc.bottom - MODLIST_PAGEBAR_H;
+
+        if (mouseY >= contentBottom) {
+            /* click landed in the page bar */
+            if (g_modLoadState == MODLOAD_ERROR) {
+                StartModFetch(hwnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (g_modLoadState == MODLOAD_LOADING) return 0;
+
+            PagebarLayout lay;
+            ComputePagebarLayout(rc, &lay);
+
+            if (mouseX >= lay.prevRc.left && mouseX <= lay.prevRc.right &&
+                mouseY >= lay.prevRc.top && mouseY <= lay.prevRc.bottom) {
+                if (g_modCurrentPage > 0) {
+                    g_modCurrentPage--;
+                    g_modScrollY = 0;
+                    RebuildModListView();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+                return 0;
+            }
+            if (mouseX >= lay.nextRc.left && mouseX <= lay.nextRc.right &&
+                mouseY >= lay.nextRc.top && mouseY <= lay.nextRc.bottom) {
+                if (g_modCurrentPage + 1 < lay.totalPages) {
+                    g_modCurrentPage++;
+                    g_modScrollY = 0;
+                    RebuildModListView();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                } else if (g_modHasMore) {
+                    g_modPendingAdvance = TRUE;
+                    StartModFetch(hwnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
+                return 0;
+            }
+            for (int i = 0; i < lay.visibleCount; i++) {
+                RECT r = lay.pageRc[i];
+                if (mouseX >= r.left && mouseX <= r.right && mouseY >= r.top && mouseY <= r.bottom) {
+                    if (lay.pageNum[i] != g_modCurrentPage) {
+                        g_modCurrentPage = lay.pageNum[i];
+                        g_modScrollY = 0;
+                        RebuildModListView();
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                    return 0;
+                }
+            }
+            return 0;
+        }
+
+        int pageStart = g_modCurrentPage * MODLIST_PAGE_SIZE;
+        int pageEnd = pageStart + MODLIST_PAGE_SIZE;
+        if (pageEnd > g_modFilteredCount) pageEnd = g_modFilteredCount;
+        int rowsOnPage = pageEnd - pageStart;
+
+        int absY = mouseY + g_modScrollY - MODLIST_HEADER_H;
+        int ri = (absY >= 0) ? (absY / MODLIST_ROW_H) : -1;
+        if (ri >= 0 && ri < rowsOnPage) {
+            int rowScreenY = MODLIST_HEADER_H + ri * MODLIST_ROW_H - g_modScrollY;
+            RECT btnRc = ModListInstallBtnRect(rc, rowScreenY);
+            if (mouseX >= btnRc.left && mouseX <= btnRc.right && mouseY >= btnRc.top && mouseY <= btnRc.bottom) {
+                ModListDoInstall(hwnd, g_modFilteredIndices[pageStart + ri]);
+            }
+        }
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+        RECT rc; GetClientRect(hwnd, &rc);
+        int contentBottom = rc.bottom - MODLIST_PAGEBAR_H;
+        int pageStart = g_modCurrentPage * MODLIST_PAGE_SIZE;
+        int pageEnd = pageStart + MODLIST_PAGE_SIZE;
+        if (pageEnd > g_modFilteredCount) pageEnd = g_modFilteredCount;
+        int rowsOnPage = pageEnd - pageStart;
+        if (rowsOnPage < 0) rowsOnPage = 0;
+
+        int totalH = MODLIST_HEADER_H + rowsOnPage * MODLIST_ROW_H;
+        int maxScroll = totalH - contentBottom;
+        if (maxScroll < 0) maxScroll = 0;
+        short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+        g_modScrollY -= (delta / WHEEL_DELTA) * MODLIST_ROW_H;
+        if (g_modScrollY < 0) g_modScrollY = 0;
+        if (g_modScrollY > maxScroll) g_modScrollY = maxScroll;
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_TIMER: {
+        if (wParam == MODLIST_SEARCH_DEBOUNCE_TIMER_ID) {
+            KillTimer(hwnd, MODLIST_SEARCH_DEBOUNCE_TIMER_ID);
+            GetWindowTextW(g_hModSearchEdit, g_modSearchQuery, 127);
+            g_modCurrentPage = 0;
+            g_modScrollY = 0;
+
+            /* a non-empty query is a fresh Util/Search/Results query;
+               clearing it returns to the regular Mod/Index browse fetch -
+               either way what's cached was fetched under a different
+               query/endpoint, so start over rather than locally
+               re-filtering the old cache */
+            for (int i = 0; i < g_modCount; i++) {
+                if (g_modEntries[i].thumb) DeleteObject(g_modEntries[i].thumb);
+            }
+            g_modCount = 0;
+            g_modFilteredCount = 0;
+            g_modNextPage = 1;
+            g_modPendingAdvance = FALSE;
+            StartModFetch(g_hModListWnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_COMMAND:
+        if (LOWORD(wParam) == ID_MODLIST_SEARCH && HIWORD(wParam) == EN_CHANGE) {
+            /* debounce - wait for the user to pause typing before firing a
+               fresh server request, rather than one per keystroke */
+            SetTimer(hwnd, MODLIST_SEARCH_DEBOUNCE_TIMER_ID, MODLIST_SEARCH_DEBOUNCE_MS, NULL);
+            return 0;
+        }
+        if (LOWORD(wParam) == ID_MODLIST_SORT && HIWORD(wParam) == CBN_SELCHANGE) {
+            int sel = (int)SendMessageW(g_hModSortCombo, CB_GETCURSEL, 0, 0);
+            if (sel >= 0) g_modSortMode = (ModSortMode)sel;
+            g_modCurrentPage = 0;
+            g_modScrollY = 0;
+
+            if (ModSortServerValue(g_modSortMode) != NULL) {
+                /* Likes/Views are real server-side orderings - what's
+                   cached so far was fetched under a DIFFERENT order (or
+                   no particular order), so "most liked among an arbitrary
+                   newest-biased sample" isn't the same thing as "most
+                   liked overall". Start over with a fresh fetch in the
+                   actual requested order instead of just re-sorting the
+                   old cache. */
+                for (int i = 0; i < g_modCount; i++) {
+                    if (g_modEntries[i].thumb) DeleteObject(g_modEntries[i].thumb);
+                }
+                g_modCount = 0;
+                g_modFilteredCount = 0;
+                g_modNextPage = 1;
+                g_modPendingAdvance = FALSE;
+                StartModFetch(g_hModListWnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
+            } else {
+                /* Newest/Name have no server equivalent (Newest is just
+                   the default fetch order anyway) - re-sorting whatever
+                   is already cached, using its real stored dates/names,
+                   is correct regardless of what order it was fetched in. */
+                RebuildModListView();
+            }
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+        break;
+
+    case WM_APP_MODS_LOADED: {
+        ModFetchResult* result = (ModFetchResult*)lParam;
+        int page = (int)wParam;
+        if (result) {
+            if (result->ok) {
+                int room = MAX_MOD_ENTRIES - g_modCount;
+                int toCopy = result->count < room ? result->count : room;
+                for (int i = 0; i < toCopy; i++) g_modEntries[g_modCount++] = result->entries[i];
+                /* anything beyond capacity is discarded - free its bitmap
+                   since ownership wasn't transferred */
+                for (int i = toCopy; i < result->count; i++) {
+                    if (result->entries[i].thumb) DeleteObject(result->entries[i].thumb);
+                }
+                g_modLoadState = MODLOAD_LOADED;
+                g_modHasMore = result->hasMore && (room > toCopy || toCopy == result->count);
+                /* page (wParam) is already the next unfetched raw page - the
+                   worker thread increments it internally as it walks
+                   forward across however many raw pages it had to check */
+                g_modNextPage = page;
+                RebuildModListView(); /* also auto-advances onto the newly
+                                          loaded page if the user was
+                                          waiting on Next to bring it in */
+            } else {
+                if (g_modCount == 0) {
+                    /* nothing loaded at all yet - a bare error+retry
+                       screen makes sense since there's nothing to browse */
+                    g_modLoadState = MODLOAD_ERROR;
+                } else {
+                    /* mods from earlier fetches are already loaded and
+                       browsable - a failed "load more" attempt shouldn't
+                       take away Prev/page-number navigation to them. Stay
+                       in LOADED so the normal page bar keeps showing;
+                       hasMore stays TRUE so Next can be clicked again to
+                       retry rather than silently vanishing. */
+                    g_modLoadState = MODLOAD_LOADED;
+                    g_modHasMore = TRUE;
+                }
+                g_modPendingAdvance = FALSE;
+                wcsncpy(g_modErrorMsg, result->errMsg, 255);
+                g_modErrorMsg[255] = 0;
+            }
+            free(result->entries); /* bitmaps now owned by g_modEntries (or freed above) */
+            free(result);
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
+
+    case WM_DESTROY:
+        KillTimer(hwnd, MODLIST_SEARCH_DEBOUNCE_TIMER_ID);
+        for (int i = 0; i < g_modCount; i++) {
+            if (g_modEntries[i].thumb) DeleteObject(g_modEntries[i].thumb);
+        }
+        g_modCount = 0;
+        g_modLoadState = MODLOAD_IDLE;
+        g_modNextPage = 1;
+        g_modHasMore = TRUE;
+        g_modScrollY = 0;
+        g_modFilteredCount = 0;
+        g_modSearchQuery[0] = 0;
+        g_modSortMode = MODSORT_NEWEST;
+        g_modCurrentPage = 0;
+        g_modPendingAdvance = FALSE;
+        g_hModSearchEdit = NULL;
+        g_hModSortCombo = NULL;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static HWND CreateModListWnd(HWND parent, HINSTANCE hInst, int x, int y, int w, int h)
+{
+    static BOOL classRegistered = FALSE;
+    const wchar_t CLASS_NAME[] = L"CVLauncherModListWnd";
+    if (!classRegistered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc   = ModListWndProc;
+        wc.hInstance     = hInst;
+        wc.lpszClassName = CLASS_NAME;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL;
+        RegisterClassW(&wc);
+        classRegistered = TRUE;
+    }
+    return CreateWindowExW(WS_EX_CLIENTEDGE, CLASS_NAME, NULL,
+        WS_CHILD | WS_BORDER,
+        x, y, w, h, parent, NULL, hInst, NULL);
+}
+
+/* Shows the Launcher tab's own content (real child windows + the overlay-
+   drawn text) or the Browse Mods tab's list window, and kicks off the
+   first fetch the first time Browse Mods is opened. */
+static void SwitchTab(HWND hwnd, AppTab newTab)
+{
+    if (g_activeTab == newTab) return;
+    g_activeTab = newTab;
+
+    BOOL showLauncher = (newTab == TAB_LAUNCHER);
+    for (int i = 0; i < g_launcherPageWndCount; i++) {
+        ShowWindow(g_launcherPageWnds[i], showLauncher ? SW_SHOW : SW_HIDE);
+    }
+    for (int i = 0; i < NUM_OVERLAY_LABELS; i++) {
+        g_overlayLabels[i].visible = showLauncher;
+    }
+    if (g_hModListWnd) {
+        ShowWindow(g_hModListWnd, showLauncher ? SW_HIDE : SW_SHOW);
+    }
+
+    if (newTab == TAB_BROWSE && g_modLoadState == MODLOAD_IDLE) {
+        StartModFetch(g_hModListWnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
+    }
+
+    if (g_hTabLauncherBtn) InvalidateRect(g_hTabLauncherBtn, NULL, TRUE);
+    if (g_hTabBrowseBtn) InvalidateRect(g_hTabBrowseBtn, NULL, TRUE);
+    InvalidateRect(hwnd, NULL, FALSE);
 }
 
 /* forward declaration - defined near the end of the file, but needed by
@@ -1477,9 +3144,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         LoadSettings();
         g_hInstance = hInst;
 
+        /* ===== tab row: Launcher / Browse Mods ===== */
+        #define TAB_TOP 15
+        #define TAB_H   32
+        #define TAB_BOTTOM (TAB_TOP + TAB_H)
+
+        g_hTabLauncherBtn = MakeButton(hwnd, hInst, L"Launcher", 15, TAB_TOP, 110, TAB_H, ID_TAB_LAUNCHER, g_fontRegular);
+        g_hTabBrowseBtn = MakeButton(hwnd, hInst, L"Browse Mods", 130, TAB_TOP, 140, TAB_H, ID_TAB_BROWSE, g_fontRegular);
+
         /* ===== header bar: Mod Folder / Get Mods / Info on the left,
            Dark Mode on the far right ===== */
-        #define HEADER_TOP 15
+        #define HEADER_TOP (TAB_BOTTOM + 10)
         #define HEADER_H   36
         #define HEADER_BOTTOM (HEADER_TOP + HEADER_H)
         #define CONTENT_TOP (HEADER_BOTTOM + 15)
@@ -1488,9 +3163,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         MakeButton(hwnd, hInst, L"Get Mods", 165, HEADER_TOP, 140, HEADER_H, ID_GET_MODS, g_fontRegular);
         MakeButton(hwnd, hInst, L"\u24D8", 315, HEADER_TOP, HEADER_H, HEADER_H, ID_README_INFO, g_fontRegular);
 
-        g_hDarkModeCheck = MakeCheckbox(hwnd, hInst, L"Dark Mode", 635 - 110, HEADER_TOP + (HEADER_H - 22) / 2,
-            110, 22, IDC_DARKMODE_CHECK, g_fontRegular);
-        SendMessageW(g_hDarkModeCheck, BM_SETCHECK, g_darkMode ? BST_CHECKED : BST_UNCHECKED, 0);
+        /* Owner-drawn, like every other header button - a native
+           BS_AUTOCHECKBOX keeps its check-glyph background theme-drawn no
+           matter what colors are returned from WM_CTLCOLORSTATIC, which is
+           exactly why it stood out with a mismatched light box in dark
+           mode. Drawing our own glyph avoids that entirely. */
+        g_hDarkModeCheck = MakeButton(hwnd, hInst, g_darkMode ? L"\u2611 Dark Mode" : L"\u2610 Dark Mode",
+            635 - 130, HEADER_TOP, 130, HEADER_H, IDC_DARKMODE_CHECK, g_fontRegular);
 
         /* side image */
         g_hBitmap = LoadBitmapW(hInst, MAKEINTRESOURCEW(IDB_SIDEIMAGE));
@@ -1498,27 +3177,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             WS_CHILD | WS_VISIBLE | SS_BITMAP,
             15, CONTENT_TOP, 250, 333, hwnd, NULL, hInst, NULL);
         SendMessageW(hImg, STM_SETIMAGE, (WPARAM)IMAGE_BITMAP, (LPARAM)g_hBitmap);
+        TrackLauncherPageWnd(hImg);
 
         int rx = 285;   /* right column x */
 
         g_overlayLabels[0].text = L"The Choicer Voicer";
         g_overlayLabels[0].rect = (RECT){ rx, CONTENT_TOP + 5, rx + 230, CONTENT_TOP + 5 + 34 };
         g_overlayLabels[0].font = g_fontTitle;
+        g_overlayLabels[0].visible = TRUE;
 
         g_overlayLabels[1].text = L"Launcher; Choose a version from the dropdown windows to play the version you want.";
         g_overlayLabels[1].rect = (RECT){ rx, CONTENT_TOP + 43, rx + 350, CONTENT_TOP + 43 + 54 };
         g_overlayLabels[1].font = g_fontRegular;
+        g_overlayLabels[1].visible = TRUE;
 
         /* Normal Mode card: bordered panel using more of the width/height
            alongside the side image, instead of a thin single-height row */
         MakeGroupBox(hwnd, hInst, L"Normal Mode", rx, CONTENT_TOP + 117, 350, 98, g_fontRegular);
         g_hNormalCombo = MakeCombo(hwnd, hInst, rx + 15, CONTENT_TOP + 151, 215, 200, IDC_NORMAL_COMBO, g_fontRegular);
         g_hLaunchNormalBtn = MakeButton(hwnd, hInst, L"Launch", rx + 240, CONTENT_TOP + 151, 95, 30, ID_LAUNCH_NORMAL, g_fontRegular);
+        TrackLauncherPageWnd(g_hNormalCombo);
+        TrackLauncherPageWnd(g_hLaunchNormalBtn);
 
         /* Compatibility Mode card */
         MakeGroupBox(hwnd, hInst, L"Compatibility Mode", rx, CONTENT_TOP + 229, 350, 98, g_fontRegular);
         g_hCompatCombo = MakeCombo(hwnd, hInst, rx + 15, CONTENT_TOP + 263, 215, 200, IDC_COMPAT_COMBO, g_fontRegular);
         g_hLaunchCompatBtn = MakeButton(hwnd, hInst, L"Launch", rx + 240, CONTENT_TOP + 263, 95, 30, ID_LAUNCH_COMPAT, g_fontRegular);
+        TrackLauncherPageWnd(g_hCompatCombo);
+        TrackLauncherPageWnd(g_hLaunchCompatBtn);
 
         /* discover versions on disk and fill the two dropdowns */
         {
@@ -1548,11 +3234,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         g_overlayLabels[2].text = L"Install downloaded mod to:";
         g_overlayLabels[2].rect = (RECT){ 15, MOD_SECTION_TOP, 15 + 190, MOD_SECTION_TOP + 20 };
         g_overlayLabels[2].font = g_fontRegular;
+        g_overlayLabels[2].visible = TRUE;
         g_hPackCombo = MakeCombo(hwnd, hInst, 210, MOD_SECTION_TOP - 4, 200, 200, IDC_PACK_COMBO, g_fontRegular);
         for (int i = 0; i < NUM_PACK_FOLDERS; i++) {
             SendMessageW(g_hPackCombo, CB_ADDSTRING, 0, (LPARAM)PACK_FOLDERS[i]);
         }
-        SendMessageW(g_hPackCombo, CB_SETCURSEL, 0, 0);
+        {
+            LRESULT foundIdx = g_lastPackFolder[0]
+                ? SendMessageW(g_hPackCombo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)g_lastPackFolder)
+                : CB_ERR;
+            SendMessageW(g_hPackCombo, CB_SETCURSEL, (foundIdx == CB_ERR) ? 0 : (WPARAM)foundIdx, 0);
+        }
+        TrackLauncherPageWnd(g_hPackCombo);
 
         HWND hDrop = CreateWindowW(L"STATIC",
             L"Drag a .zip/.rar file or a GameBanana mod link here",
@@ -1561,13 +3254,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         SendMessageW(hDrop, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
         g_dropZoneRect.left = 15; g_dropZoneRect.top = MOD_SECTION_TOP + 28;
         g_dropZoneRect.right = 15 + 620; g_dropZoneRect.bottom = MOD_SECTION_TOP + 28 + 70;
+        TrackLauncherPageWnd(hDrop);
 
-        /* small subtitle under the drop zone explaining that GameBanana
-           wants the actual download link, not the mod page link */
-        g_overlayLabels[3].text = L"Tip: For the link method to work, add a https:// in front of the 'gamebanana.com/mod' link. The downloader won't work without it. Download links [https://gamebanana.com/dl/######] also work.";
+        /* small subtitle under the drop zone explaining how to use the
+           GameBanana link-drop method (and that https:// must be included) */
+        g_overlayLabels[3].text =
+            L"Tip: For the link method to work, add a https:// in front of the "
+            L"'gamebanana.com/mods' link. The downloader won't work without it. "
+            L"Download links [https://gamebanana.com/dl/######] also work.";
         g_overlayLabels[3].rect = (RECT){ g_dropZoneRect.left, g_dropZoneRect.bottom + 4,
                                            g_dropZoneRect.left + 620, g_dropZoneRect.bottom + 4 + 32 };
         g_overlayLabels[3].font = g_fontSmall;
+        g_overlayLabels[3].visible = TRUE;
+
+        /* Browse Mods tab: a single scrollable list window covering the
+           same footprint the Launcher tab's content uses, so switching
+           tabs is just show/hide of two mutually-exclusive halves */
+        {
+            RECT crc; GetClientRect(hwnd, &crc);
+            int listH = crc.bottom - 15 - CONTENT_TOP;
+            g_hModListWnd = CreateModListWnd(hwnd, hInst, 15, CONTENT_TOP, 620, listH);
+        }
 
         /* animated backdrop: tinted image + slow pulsing/drifting stars */
         g_hBgLightBitmap = LoadBitmapW(hInst, MAKEINTRESOURCEW(IDB_BGLIGHT));
@@ -1612,6 +3319,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             BOOL pressed = (dis->itemState & ODS_SELECTED) != 0;
             BOOL disabled = (dis->itemState & ODS_DISABLED) != 0;
             BOOL hovered = GetPropW(dis->hwndItem, L"CVHover") != NULL;
+
+            /* the two tab buttons show which tab is active by staying in
+               the "pressed" fill permanently, like a selected tab */
+            if ((dis->CtlID == ID_TAB_LAUNCHER && g_activeTab == TAB_LAUNCHER) ||
+                (dis->CtlID == ID_TAB_BROWSE && g_activeTab == TAB_BROWSE)) {
+                pressed = TRUE;
+            }
 
             COLORREF fillNormal = g_darkMode ? COLOR_DARK_PANEL : COLOR_LIGHT_PANEL;
             COLORREF fillHover = g_darkMode ? RGB(58,58,64) : RGB(228,230,235);
@@ -1682,11 +3396,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case ID_MODDING:       OpenModdingFolder(hwnd); break;
             case ID_GET_MODS:      OpenGetMods(hwnd); break;
             case ID_README_INFO:   ShowFirstRunPopup(hwnd, g_hInstance); break;
+            case ID_TAB_LAUNCHER:  SwitchTab(hwnd, TAB_LAUNCHER); break;
+            case ID_TAB_BROWSE:    SwitchTab(hwnd, TAB_BROWSE); break;
             case IDC_DARKMODE_CHECK:
-                g_darkMode = (SendMessageW(g_hDarkModeCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                g_darkMode = !g_darkMode;
+                SetWindowTextW(g_hDarkModeCheck, g_darkMode ? L"\u2611 Dark Mode" : L"\u2610 Dark Mode");
                 SaveSettings();
                 ApplyThemeColors(hwnd);
                 break;
+            }
+        } else if (HIWORD(wParam) == CBN_SELCHANGE && LOWORD(wParam) == IDC_PACK_COMBO) {
+            /* remember the chosen pack folder immediately, so it's
+               persisted no matter how the app ends up being closed */
+            int sel = (int)SendMessageW(g_hPackCombo, CB_GETCURSEL, 0, 0);
+            if (sel != CB_ERR) {
+                SendMessageW(g_hPackCombo, CB_GETLBTEXT, (WPARAM)sel, (LPARAM)g_lastPackFolder);
+                SaveSettings();
             }
         }
         return 0;
@@ -1855,7 +3580,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
     RegisterClassW(&wc);
 
-    RECT rc = {0, 0, 650, 565};
+    RECT rc = {0, 0, 650, 610};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     AdjustWindowRect(&rc, style, FALSE);
 
