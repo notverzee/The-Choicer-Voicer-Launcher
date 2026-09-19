@@ -50,3 +50,4 @@ If you have any questions or things I should heed notice towards, join my Discor
 
 ### Specific Ver. Folder [Don't forget the .txt file!] ^^^
 
+NOTICE: This program was created with the assistance of Claude Sonnet 5.
