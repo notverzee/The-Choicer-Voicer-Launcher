@@ -12,25 +12,27 @@ The launcher needs to be placed in a directory like this:
   - 0.#.#
     - 0.#.# EXE
     - display.txt (You need to type in what you want this EXE to display as in the launcher via this file.)
+
+Or, you can add the version inside the launcher by uploading the EXE into the right drop-in box.
    
 You can add as many versions as you wish inside the normal and compatibility folders in the same format forever, as the launcher includes a drop-down menu for both editions that will show you all the versions you've added in the respective folders.
 
 You can also add the launcher to Steam as a Non-Steam Game, and opening it will open the launcher, and opening one of the games you've added will still work seamlessly.
 ## How To Mod
 Inside the launcher, there are four points of interest below the basic functionality:
-- Browse Mods
-- Get Mods
-- Modding Folder
-- Install downloaded mod to: / Drag a .zip or .rar mod file or GameBanana link here
+- Main Launch Page
+- Mod Browser
+- Drag 'n Drop Box
+- Folder Icon
 
-The main and most recommended modding method is the Browse Mods page, which allows you to search and find any mod for the game, and also to download them all in the same application.
+The main and most recommended modding method is the Mod Browser, which allows you to search for and find any mod for the game and also to download them all in the same application.
 <img width="652" height="637" alt="Screenshot 2026-09-06 232907" src="https://github.com/user-attachments/assets/2e1b6c3e-b287-4fae-b66b-7e9b60a99a50" />
 
-Pressing "Get Mods" redirects you to the GameBanana page for The Choicer Voicer. When you download your mods, you can go into the launcher again, press the drag & drop menu for the right folder it needs to go into, and you drag your mod(s) to the box below. It automatically extracts the zip/rar file(s) and makes them work immediately.
+The drag-and-drop box is an alternative method if you instead have a link to a mod you'd like to download.
 
-Gamebanana links have to include the https:// at the bginning of it, or it will NOT work.
+Gamebanana links have to include https:// at the beginning of it, or it will NOT work.
 
-(NOTICE): If a mod has a weirder setup, like a readme.txt next to where the main folder is in the zip, it may not work as intended, so make sure it worked properly by pressing the 'Modding Folder' button to enter your mods folder before double-checking if it extracted correctly.)
+(NOTICE): If a mod has a weirder setup, like a readme.txt next to where the main folder is in the zip, it may not work as intended, so make sure it worked properly by pressing the Folder Icon to enter your mods folder before double-checking if it extracted correctly.)
 
 ## Questions?
 If you have any questions or things I should heed notice towards, join my Discord server at https://twechon.com/discord or email me at support@twechon.com and I'll happily answer you.
