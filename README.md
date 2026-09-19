@@ -1,6 +1,6 @@
 # The-Choicer-Voicer-Launcher
 A simple EXE that allows you to open any version of The Choicer Voicer all in one place, along with seamlessly installing mods by simply dragging and dropping your zip/rar file(s) into the drag-and-drop box in the launcher.
-<img width="652" height="592" alt="Screenshot 2026-08-29 163949" src="https://github.com/user-attachments/assets/21ee8e69-3eb7-425b-a0b1-67aa1f45c038" />
+<img width="822" height="647" alt="Screenshot 2026-09-19 112140" src="https://github.com/user-attachments/assets/aae547be-d7e8-4305-ba29-ec012ce1493a" />
 ## How To Use (Basic functioning)
 The launcher needs to be placed in a directory like this:
 - The Choicer Voicer Launcher.exe
@@ -26,11 +26,11 @@ Inside the launcher, there are four points of interest below the basic functiona
 - Folder Icon
 
 The main and most recommended modding method is the Mod Browser, which allows you to search for and find any mod for the game and also to download them all in the same application.
-<img width="652" height="637" alt="Screenshot 2026-09-06 232907" src="https://github.com/user-attachments/assets/2e1b6c3e-b287-4fae-b66b-7e9b60a99a50" />
+<img width="822" height="647" alt="Screenshot 2026-09-19 112146" src="https://github.com/user-attachments/assets/6c4db7b8-d746-4017-9319-1568680aa922" />
 
 The drag-and-drop box is an alternative method if you instead have a link to a mod you'd like to download.
 
-Gamebanana links have to include https:// at the beginning of it, or it will NOT work.
+GameBanana links have to include https:// at the beginning of it, or it will NOT work.
 
 (NOTICE): If a mod has a weirder setup, like a readme.txt next to where the main folder is in the zip, it may not work as intended, so make sure it worked properly by pressing the Folder Icon to enter your mods folder before double-checking if it extracted correctly.)
 
@@ -44,7 +44,7 @@ If you have any questions or things I should heed notice towards, join my Discor
 
 <img width="718" height="166" alt="Screenshot 2026-08-22 125357" src="https://github.com/user-attachments/assets/c485ba03-4d4b-4bf7-ad2e-fa2640941d82" />
 
-### Versions Folder (Compatibility) [Normal looks the same, all versions can be what you want them to be] ^^^
+### Versions Folder (Compatibility) [Normal looks the same; all versions can be what you want them to be] ^^^
 
 <img width="761" height="166" alt="Screenshot 2026-08-22 125426" src="https://github.com/user-attachments/assets/7e45b09b-356f-4db7-8b1a-19691e427b22" />
 
