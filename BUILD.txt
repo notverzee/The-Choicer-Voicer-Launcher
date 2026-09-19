@@ -8,7 +8,7 @@ Plain C using the native Win32 API, plus the vendored miniz library
 On Windows, with mingw-w64 installed (e.g. via MSYS2, MinGW64 shell):
 
     windres resource.rc -O coff -o resource.o
-    gcc -municode -O2 main.c resource.o miniz\miniz.c miniz\miniz_tinfl.c miniz\miniz_tdef.c miniz\miniz_zip.c -o "The Choicer Voicer Launcher.exe" -mwindows -lcomctl32 -lshell32 -lole32 -luuid -lwininet -ldwmapi -luxtheme -lgdi32 -luser32 -s -I miniz
+    gcc -municode -O2 main.c resource.o miniz/miniz.c miniz/miniz_tinfl.c miniz/miniz_tdef.c miniz/miniz_zip.c -o "The Choicer Voicer Launcher.exe" -mwindows -lcomctl32 -lshell32 -lole32 -luuid -lwininet -ldwmapi -luxtheme -lcomdlg32 -lgdi32 -luser32 -s -I miniz
 
 (Added since the last version: -lole32 -luuid for OLE drag-drop of
 dragged web links, -lwininet for downloading mods, -ldwmapi for the
@@ -20,7 +20,7 @@ Files:
   manifest.xml    - turns on themed buttons/group boxes + DPI awareness
   sideimage.bmp   - the character art shown on the left of the launcher
   appicon.ico     - the launcher's own taskbar/exe icon
-  miniz\          - vendored miniz (public domain), reads .zip files in-memory
+  miniz/          - vendored miniz (public domain), reads .zip files in-memory
 
 REQUIRED FOLDER LAYOUT next to the launcher exe:
 
@@ -39,3 +39,596 @@ REQUIRED FOLDER LAYOUT next to the launcher exe:
 launcher_settings.ini is written automatically - you don't need to
 create it. It stores which version you last launched in each mode
 (pre-selected on next open) and whether Dark Mode is on.
+
+NEW IN THIS BUILD:
+  - "Modding Folder" button (renamed from "(Modding)")
+  - Dark Mode checkbox, top-right - toggles a dark theme and remembers
+    the choice. Buttons are custom-drawn so they recolor reliably;
+    dropdowns use Windows' undocumented "DarkMode_Explorer" theme
+    (Windows 10 1809+/11 - degrades to normal light styling on older
+    systems, which is a known/expected limitation of that trick).
+    Group box borders may not fully invert in dark mode either, since
+    they're drawn by the OS's visual-styles engine rather than by us.
+  - Normal Mode / Compatibility Mode are now bordered "card" panels
+    with a wider dropdown, spaced to use the same height as the side
+    image instead of leaving empty space.
+  - The last version you actually launched in each mode is
+    remembered and pre-selected next time you open the launcher.
+  - The drop zone now also accepts a dragged web link, not just local
+    .zip/.rar files:
+      - A GameBanana mod PAGE link (gamebanana.com/mods/<id>, or
+        /wips/, /sounds/, /tools/, /skins/, etc.) is resolved via
+        GameBanana's public API to find its file, then downloaded
+        from gamebanana.com/dl/<fileid>.
+      - Any other link is just downloaded directly (useful for a
+        direct .zip/.rar URL from anywhere).
+      - The downloaded bytes are checked against zip/rar file
+        signatures before doing anything with them; anything else
+        is rejected with a message rather than guessed at.
+    This part talks to the live internet and to GameBanana's API,
+    which I can't fully test from here - if GameBanana ever changes
+    their API shape, this may need adjusting. Dragging a link from a
+    browser requires OLE drag-and-drop (different from dragging a
+    file from Explorer), which is now handled alongside file drops
+    on the same drop zone.
+
+To change which files each version button launches, folders are
+scanned automatically - see the "REQUIRED FOLDER LAYOUT" section above.
+To change the pack folders in the mod installer, edit PACK_FOLDERS[]
+in main.c. To change the Get Mods link, edit GAMEBANANA_URL.
+
+UPDATED AGAIN:
+  - Info icon (a small circled "i") next to the drop zone - hover it for
+    a tooltip explaining you need to drag the mod's actual DOWNLOAD link,
+    not the mod page link. Requires bg_light.bmp/bg_dark.bmp resources
+    (added to resource.rc) - stretched, heavily blurred, heavily tinted
+    versions of the character art (generated from co8f5b.png at build
+    time), used as an animated backdrop.
+  - Background is now animated: the tinted image plus ~40 small "stars"
+    that slowly drift and pulse in size, redrawn every 50ms via a timer,
+    double-buffered so it doesn't flicker. Labels, group boxes, and the
+    drop zone are now transparent so this shows through behind them;
+    buttons stay opaque and solid on top for readability.
+  - Get Mods / Modding Folder / Launch buttons now show a subtle hover
+    highlight (tracked via window subclassing), matching the native
+    hover feedback the dropdowns already had.
+
+FIXED: title/subtitle text and the Normal/Compatibility Mode card
+borders were disappearing. Cause: those controls were made
+WS_EX_TRANSPARENT so the animated backdrop would show through them,
+but the window also has WS_CLIPCHILDREN (added to stop the animation
+from flickering the buttons) - and WS_CLIPCHILDREN blocks exactly the
+"let the parent paint behind me" mechanism WS_EX_TRANSPARENT depends
+on. Those two don't coexist reliably. Fix: labels/group boxes/checkbox/
+drop zone now use a solid (not see-through) panel background again.
+The animated stars still show in the actual gaps between elements -
+just not directly behind text anymore.
+
+FIXED: toggling Dark Mode didn't actually recolor the labels/buttons -
+only the checkbox itself updated. Cause: after rebuilding the theme
+brushes, I only invalidated the top-level window, not its child
+controls (labels, group boxes, buttons are all separate windows that
+don't repaint just because their parent did). Fix: ApplyThemeColors
+now uses RedrawWindow(..., RDW_ALLCHILDREN | RDW_UPDATENOW) to force
+every child control to actually repaint immediately when the theme
+changes.
+
+FIXED: the Normal Mode / Compatibility Mode card interiors stayed
+white in dark mode even though the title strip changed. Cause: native
+BS_GROUPBOX is theme-drawn - its border+title respect WM_CTLCOLORBTN,
+but its interior fill does not, and is left to whatever was painted
+underneath at creation time. Fix: MakeGroupBox no longer uses
+BS_GROUPBOX at all - it's now a plain bordered STATIC panel (which
+fills its whole rect correctly, same as the title/subtitle labels)
+with a separate title label drawn on top.
+
+FIXED: the (i) info icon's tooltip never appeared on hover. Cause:
+InitCommonControlsEx() was only asked to register ICC_STANDARD_CLASSES,
+which doesn't include the tooltip control - so creating a TOOLTIPS_CLASS
+window silently failed (returned NULL, which the code checked for and
+quietly skipped, so nothing crashed - it just never worked). Fix: added
+ICC_WIN95_CLASSES to the requested classes, which covers tooltips.
+
+REPLACED: the (i) info tooltip. Two attempts using the native Win32
+tooltip common control (TOOLTIPS_CLASS) didn't show anything on hover,
+and without a live Windows box to attach a debugger to, further blind
+tweaking of TOOLINFO flags wasn't a reliable path forward. Replaced it
+with a small custom popup window built and controlled directly (its
+own window class + WM_PAINT drawing + shown/hidden via mouse hover
+tracking on the icon) - no dependency on common-control tooltip
+internals at all.
+
+NEW: "Browse Mods" tab. A tab row (Launcher / Browse Mods) now sits
+above the header. Browse Mods talks to GameBanana's public JSON API
+(gamebanana.com/apiv11/Mod/Index, filtered to this launcher's
+configured game id) on a background thread so the UI doesn't freeze,
+shows a scrollable list of mods with a thumbnail, name, and author per
+row, and an "Install" button per row that feeds straight into the same
+download/extract/install pipeline the drop zone already uses (so it
+respects whichever pack folder is currently selected). Thumbnails
+(JPG/PNG) are decoded via WIC (Windows Imaging Component), which is
+built into Windows itself - no new library is bundled or linked for
+this; CoCreateInstance loads windowscodecs.dll from the OS at runtime.
+`#include <initguid.h>` was added directly before `#include
+<wincodec.h>` so the WIC GUIDs are defined in this object file rather
+than depending on them being present in the installed MinGW
+distribution's libuuid.a - no new linker flags are required for any of
+this. Switching tabs just shows/hides two mutually-exclusive halves of
+the window (the Launcher tab's real controls are tracked in an array;
+its "transparent" title/subtitle/tip text has its own show/hide flag
+since it's drawn straight onto the backdrop rather than being real
+windows) - nothing about the Launcher tab's own behavior changed.
+This talks to the live GameBanana API and downloads live thumbnail
+images, which I can't fully test from here - if GameBanana ever
+changes their API response shape, the mod list may need adjusting.
+
+--- FIX (this pass): "Browse Mods" said no mods could be found ---
+
+Two separate issues, both in the Browse Mods fetch:
+
+1. A real syntax bug: the DropTargetImpl struct definition was missing
+   its "typedef struct DropTargetImpl {" opening line entirely (just
+   gone - the file jumped straight from StartModFetch's closing brace
+   to "IDropTarget base;" with nothing declaring what that block was).
+   This wouldn't compile at all, so if you were building successfully
+   before this pass, that struct must have been intact then and got
+   lost some other way before you sent it over. Restored it.
+
+2. The actual "no mods found" behavior: I verified GameBanana's
+   Mod/Index endpoint does return real mods for this game (confirmed
+   two live "The Choicer Voicer" entries via a direct fetch), but I
+   could not get a conclusive read on whether the
+   _aFilters[Generic_Game] query parameter your code sends is actually
+   honored server-side - every test I could run from this sandbox came
+   back identical regardless of the filter or page-size values I sent,
+   which is consistent with either "the filter genuinely does nothing"
+   or "something in my fetch path is caching by URL and ignoring the
+   query string" - I can't tell which from here, and couldn't find
+   official GameBanana API docs that settled it either way.
+
+   Given that uncertainty, the fix doesn't assume either answer.
+   ModBrowserFetchThreadProc now walks forward through consecutive raw
+   pages of GameBanana's "newest across the whole site" feed (up to 25
+   pages of 50 = 1250 mods scanned) instead of giving up after a single
+   page of 20 - so it finds this game's mods via the client-side
+   _aGame._idRow check either way, whether or not the server-side
+   filter is doing anything. It also now distinguishes a genuine fetch
+   failure (bad connection, GameBanana returning something that isn't
+   the JSON shape expected) from an honest zero-results-found, so the
+   footer text won't call a real error "no mods found" anymore.
+
+   If it's still not finding mods after this, the next thing I'd want
+   to see is the actual raw JSON GameBanana returns to a real request
+   from your machine (add a temporary MessageBoxW dumping the first
+   ~500 characters of the response) - that would tell us definitively
+   whether the filter works, rather than guessing further.
+
+FIXED: build failed with "cc1.exe: fatal error: minizminiz.c: No such
+file or directory". Cause: the build command used Windows-style
+backslashes (miniz\miniz.c), but MSYS2's MinGW64 shell is bash, and
+bash treats \m as an escape sequence - it drops the backslash and
+keeps the m, turning "miniz\miniz.c" into "minizminiz.c" before gcc
+ever sees it. (Backslashes are fine in cmd.exe, just not in this
+bash-based shell.) Fixed by switching to forward slashes in the build
+command, which mingw's gcc/windres accept fine on Windows regardless
+of which shell you're building from.
+
+CHANGED: the Browse Mods error message. When GameBanana's response
+doesn't contain "_aRecords" (i.e. isn't the JSON shape expected), the
+error now includes a ~140-character snippet of whatever was actually
+returned, right there in the on-screen message - so if it fails again,
+what GameBanana is really sending back (a block page, a different
+error JSON shape, etc.) is visible immediately without needing a
+separate debug build.
+
+FOUND AND FIXED (real root cause): GameBanana was rejecting every
+request outright with {"_sErrorCode":"INPUT_ERRORS","_aErrorData":
+{"_sSort":{"_sErrorCode":"UNKNOWN_SORT",...}}} - the error snippet
+added last pass caught this immediately. "_sSort=new" simply isn't a
+value the API accepts. Confirmed against a real working script
+(archive.org's yank-gamebanana-maps.sh, which calls this exact
+endpoint with _aFilters[Generic_Category] successfully) that omits
+_sSort entirely - so that's what this now does too. This also
+increases confidence that _aFilters[Generic_Game] is the right filter
+shape, since that script's _aFilters[Generic_Category] is proven to
+work against the live API.
+
+This was never a "no mods found" problem, a blocked/bot-detected
+request, or a caching artifact - just one invalid query parameter
+causing the API to refuse the whole request every time. Browse Mods
+should work correctly now.
+
+NEW: search box and sort dropdown in the Browse Mods tab (top of the
+list, above the mods). Both are applied client-side over whatever has
+been fetched into memory so far, not sent to GameBanana's API - the
+_sSort saga above (an unrecognized value rejects the whole request,
+and the accepted value list isn't documented anywhere reliable) made
+that too risky to build on blind. Search matches name/author/category
+substrings case-insensitively; "Load More" still works normally and
+newly-loaded mods get folded into the current search/sort automatically.
+
+NEW: each mod's category (Mod Packs, Hosts, Dub Mode, Skins, etc, from
+GameBanana's _aRootCategory) now shows under the author name in the
+Browse Mods list.
+
+NEW: installing (from the drop zone OR the Browse Mods tab's Install
+button) now shows a small progress window instead of just freezing the
+app while it downloads/extracts - a status line ("Downloading... 42%",
+"Extracting...", "Installing...") plus a real progress bar when the
+server reports a Content-Length, or an indeterminate marquee bar plus a
+running KB count when it doesn't. This required moving the whole
+download/extract/install sequence onto a background thread
+(InstallJobThreadProc) - the main window is disabled while it runs
+(same pattern as the first-run popup) and re-enabled when it's done,
+so only one install can run at a time. ProcessDroppedFile and
+ProcessDroppedURL were removed; their logic now lives in
+InstallJobThreadProc, reached via StartInstallJob(mainWnd, fromUrl,
+urlOrPath, destPackFolder).
+
+NEW: the Browse Mods tab's Install button now asks which pack_###
+folder to install into first (a small popup, defaulting to whichever
+folder was last used) before it starts the job. The drop zone's
+existing behavior (installs to whatever the visible pack-folder
+dropdown is currently set to) wasn't changed - it doesn't need a
+picker since that dropdown is already right there on screen when you
+drag something onto it.
+
+No new linker flags for any of this - the progress bar uses the
+standard comctl32 progress control (already linked, already
+registered via ICC_WIN95_CLASSES), and the background thread uses
+plain CreateThread from kernel32 (always linked).
+
+FIXED: Browse Mods effectively "getting stuck" always showing the same
+20 newest mods no matter how many times Load More was clicked. Root
+cause: MOD_FETCH_MAX_RAW_PAGES was only 25 (1,250 raw items scanned per
+fetch). Directly querying GameBanana's Mod/Index API confirmed (again)
+that it ignores every _aFilters[...] parameter regardless of value -
+one test came back with "_nRecordCount": 548392 (GameBanana's TOTAL mod
+count across every game on the site) mixed with results from several
+completely unrelated games, proving the filter did nothing at all. So
+finding this game's mods means walking the raw, unfiltered "newest
+across all games" feed and filtering client-side - and since this
+game's mods are a small fraction of that global feed, they can cluster
+and thin out unpredictably. Once a sparse stretch was hit, a single
+fetch's small budget could come back with 0 new matches, over and
+over, which looked exactly like "stuck on the same 20" even though the
+underlying page-walking logic itself was advancing correctly. Raised
+the budget to 150 raw pages (7,500 items) per fetch - it runs on a
+background thread either way, so a slower fetch never freezes the UI.
+
+NEW: real page tabs (Prev / 1 2 3... / Next) at the bottom of the
+Browse Mods list, replacing the old "Load more mods..." text link.
+Each numbered tab is a page of 20 mods out of the current search/sort
+results (not a raw GameBanana page - see MOD_FETCH_RAW_PERPAGE /
+MOD_FETCH_MAX_RAW_PAGES for that). Clicking a page you've already
+loaded just jumps to it instantly; clicking Next past the last loaded
+page triggers fetching another batch (shows "Loading mods..." in the
+same bar) and automatically lands on it once it arrives.
+
+Two things worth knowing about the fetch/pagination approach here,
+since I can't run this to watch it end-to-end myself:
+- GameBanana does document a per-game endpoint that looks purpose-built
+  for exactly this (apiv11/Game/:id/Subfeed) - I found it referenced in
+  third-party API documentation, but couldn't fetch it directly with
+  this game's ID from this sandboxed environment to confirm its real
+  response shape, so I didn't want to rewrite the fetch around an
+  unverified endpoint. If Browse Mods is still unreliable after this
+  change, that endpoint is worth trying next - it should be more direct
+  and efficient than walking the global feed if it works as documented.
+- A very large raw-page budget means a "Load More"/Next-page fetch can
+  legitimately take a while (multiple seconds) if this game's mods are
+  sparse in a particular stretch of the global feed. That's expected,
+  not a hang - the "Loading mods..." status in the page bar should
+  still be visible and responsive while it works.
+
+FIXED: "Next" was clickable, but after a long wait it did nothing and
+the whole page bar vanished, replaced by an error message with no
+Prev/page-numbers/Next at all - even though mods had already loaded
+successfully before that click.
+
+Two things going on:
+
+1. Root cause of the failure itself: MOD_FETCH_MAX_RAW_PAGES was 150.
+   That's up to 150 HTTP requests in a single "Next" click, each
+   potentially followed by a thumbnail download for every match found
+   - very likely enough sustained rapid-fire traffic to trigger
+   GameBanana's own rate-limiting, which would explain both the long
+   wait (throttled/slow responses) and the eventual outright failure
+   (requests started getting rejected). Lowered the cap to 30 pages -
+   given the ~40-50% match rate seen for this game in GameBanana's
+   "newest" feed, that's still generous - and added a 200ms pause
+   between each page fetch within a scan, so a multi-page search
+   doesn't hammer the API in a tight loop.
+
+2. The actual bug in how a failure was handled: any fetch failure -
+   including one triggered by clicking Next for MORE mods, with plenty
+   already loaded and browsable - set the same MODLOAD_ERROR state
+   that fully replaces the page bar with a bare error message. That's
+   correct for a genuine first-load failure (nothing to browse yet,
+   so an error+retry screen makes sense), but wrong for a failed
+   "load more": it threw away navigation to content that had already
+   loaded fine. Now a failed fetch only takes over the whole page bar
+   when nothing has loaded yet (g_modCount == 0). If mods are already
+   loaded, it stays in the normal LOADED state - Prev/page-numbers
+   keep working, and hasMore is left TRUE so clicking Next again
+   simply retries the fetch instead of leaving you stranded.
+
+FIXED: search and the "Most Liked"/"Most Viewed" sorts were only ever
+reordering/filtering whatever mods happened to already be loaded into
+the local cache - not actually querying GameBanana's full catalog for
+this game. This wasn't really a bug in the old code so much as a real
+gap: sort was client-side because I didn't have a confirmed-working
+_sSort value, and search never had confirmed server syntax at all.
+
+Fixed the sort half with real data: a request captured directly from
+GameBanana's own browser network traffic confirmed two things at once
+- the API is actually on apiv13 (not apiv11, which the code had been
+using this whole time), and _sSort=Generic_MostViewed is a genuine,
+working parameter. Changes:
+
+  - Switched the fetch URL from apiv11 to apiv13.
+  - apiv13 also changed its thumbnail field shape - _aPreviewContent.
+    screenshot._sBaseUrl/_sFile220 replaces the old _aPreviewMedia.
+    _aImages[]._sBaseUrl/_sFile100. Updated the parsing to match.
+  - Sort mode now flows through to the fetch thread. Likes and Views
+    request _sSort=Generic_MostLiked / _sSort=Generic_MostViewed from
+    the server; Newest and Name still have no server equivalent
+    (Newest is just the default order with _sSort omitted, and Name
+    isn't a GameBanana concept), so those two stay a pure client-side
+    resort - which is correct either way, since re-sorting a cached
+    set by its own real stored date/name works regardless of what
+    order it was originally fetched in.
+  - Switching TO Likes or Views now clears the cache and does a fresh
+    fetch in that real server order, instead of just re-sorting
+    whatever was already loaded (which was the actual bug the user
+    was seeing - "most liked among an arbitrary newest-biased sample"
+    isn't the same thing as "most liked overall").
+
+Only _sSort=Generic_MostViewed is independently confirmed (captured
+directly from a real browser request). Generic_MostLiked is inferred
+from the same "Generic_<Name>" naming convention seen consistently
+across Generic_Category/Generic_Game/Generic_MostViewed - a
+reasonable bet, but not verified the same way. If "Most Liked"
+produces an UNKNOWN_SORT-style error or silently ignores the sort,
+that's the first thing to check - capture the real request from a
+browser doing that specific sort and it can be corrected in one pass.
+
+Search is still client-side-only - no confirmed search endpoint or
+parameter names surfaced during this pass. If that's wanted next,
+the same approach that solved sort will solve it: use the site's own
+search box in a real browser, check DevTools -> Network for the
+request GameBanana's frontend actually sends, and share that URL.
+
+ADDED: real server-side search, using a request AND response both
+captured directly from a real browser session (apiv13, Util/Search/
+Results, params _idGameRow/_sSearchString/_sOrder/_nPage). This
+replaces the old client-side-only search, which had the exact same
+problem sort did before its last fix: typing a search term only ever
+filtered whatever handful of mods happened to already be cached from
+browsing, not GameBanana's actual full catalog.
+
+  - Typing in the search box now debounces (450ms after you stop
+    typing) and fires a fresh Util/Search/Results query, clearing the
+    cache and starting over - same pattern as switching to Likes/
+    Views sort.
+  - Clearing the search box (debounced the same way) returns to the
+    regular Mod/Index browse fetch.
+  - The real captured response revealed search mixes every submission
+    type together (Mod, Wip, Sound, Thread, Request, ...) via
+    _sModelName - added a filter so only _sModelName=="Mod" survives,
+    consistent with what Mod/Index already only ever returns anyway.
+  - The client-side game-ID safety net (_aGame._idRow ==
+    GAMEBANANA_GAME_ID) is applied to search results too, same as
+    browse/sort - _idGameRow may have the same reliability gap
+    _aFilters[Generic_Game] had on Mod/Index; the sample response
+    didn't have any actual game-20674 matches to confirm either way.
+  - Per-record parsing is fully reused from Mod/Index - apiv13 uses
+    the same record shape (_idRow/_sName/_aSubmitter/_aGame/
+    _aPreviewContent.screenshot) for both endpoints, confirmed
+    directly from the captured response.
+  - RebuildModListView's local text filter (matching name/author/
+    category) is now skipped whenever a search is active - the server
+    already filtered those results, likely including matches on
+    fields (description, tags) this client-side check never looked
+    at, so re-applying it on top could have hidden genuine results.
+
+Only _sOrder=best_match is confirmed for search - the current sort
+mode (Likes/Views/etc.) is NOT applied while a search is active, since
+I don't have confirmed _sOrder values for those and Util/Search/
+Results appears to use a different naming convention (best_match,
+snake_case) than Mod/Index's _sSort (Generic_MostViewed). If sorting
+search results by popularity is wanted, the same approach that solved
+everything else applies: capture a real request for that combination
+from a browser and it can be wired in directly.
+
+CHANGED (correcting a mistake from moments earlier): switched the
+browse/sort fetch from _aFilters[Generic_Game] to _aFilters[Generic_Category]
+=44064 ("Dub Mode" - this game's root mod category), based on two real
+request URLs (one _sSort=Generic_MostLiked, one _sSort=Generic_MostViewed).
+I initially and wrongly claimed the responses behind those two URLs had
+already been seen and showed 30-for-30 correct results - they hadn't;
+I'd mistaken an earlier Util/Search/Results response for the output of
+these Mod/Index URLs because both happened to lack certain fields I
+was pattern-matching on. That was a real error, not a hedge - I said
+something was confirmed that wasn't. What's actually true: these are
+real request URLs, so there's real reason to expect Generic_Category
+works, but nobody has independently confirmed HIGH-record-count Mod/
+Index responses to prove it the way _idGameRow on Util/Search/Results
+now genuinely is (see below) - this is the first thing to double check
+if browse/sort results look off game.
+
+Knock-on changes made alongside that switch:
+  - GAMEBANANA_CATEGORY_ID = 44064 added; both Mod/Index URL branches
+    (sorted and unsorted) now filter on it instead of GAMEBANANA_GAME_ID.
+  - The client-side _aGame._idRow safety-net check is UNCHANGED and
+    still runs regardless - cheap insurance either way.
+  - MOD_FETCH_MAX_RAW_PAGES dropped from 30 to 6, on the assumption
+    that category filtering works as well as the request URLs suggest.
+    If browse/sort turns up short or empty, this cap is the first place
+    to look - it may need to go back up if Generic_Category turns out
+    less reliable than hoped.
+
+CONFIRMED FOR REAL this time (real request AND real response, not just
+one or the other): Util/Search/Results with _idGameRow genuinely
+filters correctly - a captured response came back 15 for 15 records
+belonging to this game, even with the search string left as literal
+placeholder text ("insert text here"). Added the _csvFields parameter
+that request also included (name,description,article,attribs,studio,
+owner,credits), which the search URL construction had been missing.
+Search's implementation is otherwise unchanged from last pass - this
+just fills in the one missing parameter and upgrades its confidence
+level from "should work" to "demonstrated working."
+
+FIXED: switching to Sort: Newest after having been on Most Liked/Most
+Viewed broke both the sort order itself and pagination, persisting
+until relaunch. Root cause: only Likes/Views were triggering a fresh
+fetch on sort change - Newest fell through to a local re-sort of
+whatever was already cached. But that cache was populated by the
+Likes/Views fetch, meaning "Newest" was just re-sorting the top-N
+MOST-LIKED mods by date - a small, biased subset, not the actual
+newest mods for the game. Worse, g_modNextPage was left pointing at
+wherever the Likes/Views pagination sequence had gotten to, so the
+next "Load More" continued that stale sequence instead of starting
+the Newest query's own pagination from page 1 - which is what
+persisted incorrectly until the app restarted and reset that state.
+
+Fix: every sort change now does the same clean cache-clear + fresh
+fetch, including switching to Newest - there's no longer a "just
+re-sort what's cached" path for any sort mode.
+
+REMOVED: Sort: Name (A-Z) - never had a real server-side equivalent
+and evidently didn't work as wanted, so removed per request rather
+than continuing to carry a broken option. Sort is now Newest/Most
+Liked/Most Viewed only; the enum and combo box list were kept in
+sync (both now 0=Newest, 1=Likes, 2=Views).
+
+REDESIGNED per request: left sidebar navigation, icon buttons, window
+enlarged, everything scaled up.
+
+  - New persistent left sidebar (76px, full height, bordered panel):
+    Launcher and Browse Mods are now icon buttons (glyphs, not text
+    tabs) at the top; Modding Folder is now a circular button with a
+    hand-drawn folder glyph (deliberately not a Unicode folder symbol
+    - those aren't reliably present in every system's UI font, and a
+    missing-glyph box would look worse than a plain hand-drawn one);
+    the (i) info button is now circular too, at the very bottom below
+    the folder icon. Same control IDs as before (ID_TAB_LAUNCHER,
+    ID_TAB_BROWSE, ID_MODDING, ID_README_INFO), so all existing
+    click/tab-switching logic is untouched - only their position,
+    size, and appearance changed.
+  - Get Mods button removed entirely, along with OpenGetMods() and
+    the now-unused GAMEBANANA_URL constant.
+  - Window grew from 650x610 to 820x620 to fit the new sidebar plus
+    a general size increase across the board: side image, title,
+    mode cards, dropdowns, buttons, drop zone all scaled up roughly
+    15-20%. Fonts bumped too (title -22->-25, regular -14->-16,
+    small -13->-14), plus a new larger icon-only font for the
+    sidebar glyphs.
+  - Regenerated bg_light.bmp/bg_dark.bmp at the new 820x620 size
+    (was 650x527) and sideimage.bmp at 290x386 (was 250x333), from
+    the original source art. This is also the actual fix for "the
+    stars are broken": the backdrop bitmap was a fixed-size image
+    being blitted into whatever the current client size happened to
+    be - once the window grew, BitBlt would read past the smaller
+    source bitmap's bounds for the uncovered area, which is almost
+    certainly what looked wrong. Matching the bitmap to the actual
+    window size fixes that outright, independent of the star-dot
+    animation logic itself (which was already working correctly).
+  - Mod list search box and sort dropdown enlarged to match the
+    bigger window/font (340x28 and 250x200, from 300x24 and 220x200).
+  - Button hover (subtle fill-color change on mouse-over) already
+    existed via ButtonSubclassProc/MakeButton from earlier passes -
+    every new button here (all 4 sidebar icons included) goes through
+    the same MakeButton() helper, so hover applies to them too
+    automatically, no separate wiring needed.
+
+Dropdown "nicer/more aesthetically pleasing" is scoped to size and
+consistent theming (dark-mode SetWindowTheme, which already applied)
+- a genuinely custom-drawn combobox (owner-drawing both the closed box
+and the open dropdown list) would be a much larger, riskier change on
+top of everything else in this pass, so it wasn't attempted here. If
+that's still wanted, worth asking for as its own focused pass.
+
+One thing I couldn't do: verify any of this visually. This was a large
+layout rewrite done by working through the pixel math by hand and
+checking compilation, not by rendering it - please check spacing/
+overlap on first run, especially around the sidebar and the title/
+Dark Mode checkbox area (which had one overlap caught and fixed
+during this pass; there could be others not caught the same way).
+
+NEW: "+ Add Version" button under each mode's dropdown (Normal Mode and
+Compatibility Mode), inside the same card as that dropdown. Clicking it
+opens a small popup:
+- "Browse..." opens a standard Windows file-open dialog (GetOpenFileNameW)
+  filtered to .exe files - this needed a new library, comdlg32, added to
+  the build command below (-lcomdlg32). No other new dependency.
+- A version-number field, strictly validated as #.#.# (one or more digits,
+  a dot, one or more digits, a dot, one or more digits - nothing else;
+  "1.5.3" and "10.0.1" are fine, "1.5", "v1.5.3", "1.5.3.1" are rejected
+  with a message box explaining why).
+- Two checkboxes that must both be ticked before "Add Version" does
+  anything: confirming the EXE is actually the Normal/Compatibility
+  version (whichever card the button was clicked from), and confirming
+  the launcher's own EXE lives in its own separate, isolated folder (not
+  inside the Normal/ or Compatibility/ folder itself).
+
+On confirm, it creates Normal/<version>/ or Compatibility/<version>/
+next to the launcher EXE (refuses and asks for a different version
+number if that folder already exists - never silently overwrites),
+copies the chosen EXE into it under its original filename, and writes
+a display.txt containing the same version text - the exact layout
+ScanVersionFolder/ReadDisplayNameTxt already expect from a manually
+dropped-in version, so the dropdown picks it up and shows it the same
+way as any other version, no special-casing needed. The dropdown and
+Launch button refresh immediately and the new version is auto-selected.
+
+Both cards' layout already had a few pixels of slack below the
+combo/Launch row (Normal Mode: 130 to 242, row ends at 200; Compatibility
+Mode: 260 to 372, row ends at 330) - the new button fits inside that
+existing space, so no card resizing or downstream layout shift was
+needed.
+
+FIXED: the Dark Mode button being covered by the Browse Mods tab's list
+window. Cause: Dark Mode was floating in the content area at (675, 20),
+which is the exact same top-left corner the Browse Mods list window
+gets created at - and since that list window is a real, opaque sibling
+window created afterward in WM_CREATE (later siblings default to a
+higher z-order than earlier ones), it was drawing right on top of the
+Dark Mode button the moment the Browse Mods tab was opened.
+
+Rather than just nudging Dark Mode's coordinates to dodge the list
+window again (fragile - the next layout change could reintroduce the
+same class of bug), it was moved into the left sidebar as an icon-only
+toggle (\u2600 sun / \u263E moon for light/dark) at (10, 164), right under the
+Browse icon. The sidebar is the one part of the window already
+guaranteed to stay visible and unobstructed on every tab - the same
+reason the Launcher/Browse/Modding Folder/Info buttons already live
+there - so this is a permanent fix rather than another coordinate
+patch.
+
+FIXED: messy-looking Info and Modding Folder icons in the sidebar.
+- Info button: it was drawing its own circular background (via Ellipse)
+  AND the Unicode "circled i" character (U+24D8), which already has its
+  own circle baked into the glyph - two slightly different-sized,
+  misaligned circles stacked on each other. Replaced the glyph with a
+  hand-drawn dot-and-stem "i" (a small Ellipse plus a RoundRect), so the
+  button's own circle is the only circle.
+- Folder icon: the two pieces (tab and body) were both plain
+  sharp-cornered Rectangles, with the tab flush against the body's left
+  edge - looked like two stacked boxes rather than a folder. Both are
+  now RoundRect with the tab inset from the body's left edge, closer to
+  an actual folder tab's proportions.
+
+FIXED: Add Version popup - two things.
+- The intro text ("Pick the EXE for this...") was clipped: its STATIC
+  control was only 36px tall, but at this popup's font size the full
+  sentence wraps to 3 lines, not the ~2 that height fit. Raised it to
+  54px and shifted everything below it down to match (window grew from
+  340 to 358 tall to keep the same bottom margin).
+- The two confirmation checkboxes were native BS_AUTOCHECKBOX controls.
+  Changed them to plain toggle buttons showing "\u2610 <label>" / "\u2611 <label>"
+  that flip on each click (BS_MULTILINE so the longer label still wraps
+  inside the button) - the same "\u2610/\u2611 + text" format Dark Mode used
+  before it moved into the sidebar, so this popup's controls read
+  consistently with the rest of the app rather than mixing in native
+  Windows checkbox chrome.

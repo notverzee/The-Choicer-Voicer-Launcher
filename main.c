@@ -21,6 +21,7 @@
 #include <initguid.h>
 #include <wincodec.h>
 #include <windowsx.h>
+#include <commdlg.h>
 #include <wchar.h>
 #include <wctype.h>
 #include <string.h>
@@ -36,12 +37,12 @@
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 /* ---- control / resource IDs ---- */
 #define ID_LAUNCH_NORMAL   1001
 #define ID_LAUNCH_COMPAT   1002
 #define ID_MODDING          1005
-#define ID_GET_MODS         1006
 #define IDC_DARKMODE_CHECK  1007
 
 #define IDC_NORMAL_COMBO  3001
@@ -56,6 +57,9 @@
 #define ID_TAB_LAUNCHER    5001
 #define ID_TAB_BROWSE      5002
 
+#define ID_ADD_NORMAL_VERSION 7010
+#define ID_ADD_COMPAT_VERSION 7011
+
 #define IDB_SIDEIMAGE   100
 #define IDI_APPICON     101
 #define IDB_BGLIGHT     102
@@ -66,8 +70,7 @@ static const wchar_t* NORMAL_DIR_NAME = L"Normal";
 static const wchar_t* COMPAT_DIR_NAME = L"Compatibility";
 
 static const wchar_t* GAME_DIR_SUBPATH = L"\\YeahMaybe\\ChoicerVoicer\\game";
-static const wchar_t* GAMEBANANA_URL = L"https://gamebanana.com/games/20674";
-/* must stay in sync with the numeric suffix of GAMEBANANA_URL above */
+/* must stay in sync with the game's numeric ID used throughout */
 static const long GAMEBANANA_GAME_ID = 20674;
 /* "Dub Mode" - confirmed via two real captured requests (both sort
    variants) where every single returned record, 30 for 30, had
@@ -103,6 +106,7 @@ static const wchar_t* PACK_FOLDERS[] = {
 static HFONT g_fontTitle    = NULL;
 static HFONT g_fontRegular  = NULL;
 static HFONT g_fontSmall    = NULL;
+static HFONT g_fontIcon     = NULL;
 static HBITMAP g_hBitmap    = NULL;
 static HWND   g_hPackCombo  = NULL;
 static HWND   g_hDarkModeCheck = NULL;
@@ -701,11 +705,6 @@ static void OpenModdingFolder(HWND hwnd)
     }
 
     ShellExecuteW(hwnd, L"open", fullPath, NULL, NULL, SW_SHOWNORMAL);
-}
-
-static void OpenGetMods(HWND hwnd)
-{
-    ShellExecuteW(hwnd, L"open", GAMEBANANA_URL, NULL, NULL, SW_SHOWNORMAL);
 }
 
 /* ===================== zip extraction (miniz, in-memory) ===================== */
@@ -1616,6 +1615,343 @@ static void ShowDestPicker(HWND hOwner, HINSTANCE hInst, const wchar_t* profileU
     SetFocus(g_hDestPickerCombo);
 }
 
+/* ===================== "Add Version" popup ===================== */
+/* Copies a chosen EXE into a new Normal/<version>/ or
+   Compatibility/<version>/ folder alongside a display.txt containing
+   that same version string - matching exactly the layout
+   ScanVersionFolder/ReadDisplayNameTxt already expect from a manually
+   dropped-in version, so the new entry shows up in the dropdown the
+   same way any other version would. */
+
+#define ID_ADDVER_BROWSE  7001
+#define ID_ADDVER_ADD     7002
+#define ID_ADDVER_CANCEL  7003
+#define ID_ADDVER_CHECK1  7004
+#define ID_ADDVER_CHECK2  7005
+
+static BOOL g_addVerIsNormal = TRUE;
+static wchar_t g_addVerExePath[MAX_PATH] = L"";
+static HWND g_hAddVerOwner = NULL;
+static HWND g_hAddVerExeEdit = NULL;
+static HWND g_hAddVerVersionEdit = NULL;
+static HWND g_hAddVerCheck1 = NULL;
+static HWND g_hAddVerCheck2 = NULL;
+static BOOL g_addVerCheck1State = FALSE;
+static BOOL g_addVerCheck2State = FALSE;
+static wchar_t g_addVerCheck1Label[128] = L"";
+static wchar_t g_addVerCheck2Label[128] = L"";
+
+/* strict #.#.# - each # is one or more digits, exactly two dots,
+   nothing else allowed anywhere in the string */
+static BOOL IsValidVersionString(const wchar_t* s)
+{
+    int dots = 0;
+    int digitsInSegment = 0;
+    for (const wchar_t* p = s; *p; p++) {
+        if (*p == L'.') {
+            if (digitsInSegment == 0) return FALSE; /* e.g. "..", ".1.2", "1..2" */
+            dots++;
+            digitsInSegment = 0;
+        } else if (*p >= L'0' && *p <= L'9') {
+            digitsInSegment++;
+        } else {
+            return FALSE; /* any non-digit, non-dot character */
+        }
+    }
+    return digitsInSegment > 0 && dots == 2; /* no trailing dot, exactly 3 segments */
+}
+
+static BOOL BrowseForVersionExe(HWND hOwner, wchar_t* outPath, DWORD outCap)
+{
+    wchar_t fileBuf[MAX_PATH] = L"";
+    OPENFILENAMEW ofn; memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = hOwner;
+    ofn.lpstrFilter = L"Programs (*.exe)\0*.exe\0All Files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuf;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Select the version's EXE";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return FALSE;
+    wcsncpy(outPath, fileBuf, outCap - 1);
+    outPath[outCap - 1] = 0;
+    return TRUE;
+}
+
+static void CloseAddVersionPopup(HWND hwnd)
+{
+    HWND owner = g_hAddVerOwner;
+    DestroyWindow(hwnd);
+    if (owner) { EnableWindow(owner, TRUE); SetForegroundWindow(owner); }
+    g_hAddVerExeEdit = NULL;
+    g_hAddVerVersionEdit = NULL;
+    g_hAddVerCheck1 = NULL;
+    g_hAddVerCheck2 = NULL;
+    g_addVerCheck1State = FALSE;
+    g_addVerCheck2State = FALSE;
+}
+
+static void PerformAddVersion(HWND hwnd)
+{
+    wchar_t verBuf[64];
+    GetWindowTextW(g_hAddVerVersionEdit, verBuf, 64);
+
+    /* trim surrounding whitespace */
+    int vlen = (int)wcslen(verBuf);
+    while (vlen > 0 && (verBuf[vlen - 1] == L' ' || verBuf[vlen - 1] == L'\t')) verBuf[--vlen] = 0;
+    int vstart = 0;
+    while (verBuf[vstart] == L' ' || verBuf[vstart] == L'\t') vstart++;
+    if (vstart > 0) memmove(verBuf, verBuf + vstart, (size_t)(vlen - vstart + 1) * sizeof(wchar_t));
+
+    if (!g_addVerExePath[0]) {
+        MessageBoxW(hwnd, L"Choose an EXE file first.", L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    if (!IsValidVersionString(verBuf)) {
+        MessageBoxW(hwnd, L"Version number must be in #.#.# format (e.g. 1.5.3).",
+            L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    if (!g_addVerCheck1State || !g_addVerCheck2State) {
+        MessageBoxW(hwnd, L"Please confirm both checkboxes before adding this version.",
+            L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
+        return;
+    }
+
+    wchar_t exeDir[MAX_PATH];
+    GetExeDir(exeDir, MAX_PATH);
+    wchar_t modeDir[MAX_PATH];
+    wsprintfW(modeDir, L"%s\\%s", exeDir, g_addVerIsNormal ? NORMAL_DIR_NAME : COMPAT_DIR_NAME);
+
+    wchar_t versionDir[MAX_PATH];
+    wsprintfW(versionDir, L"%s\\%s", modeDir, verBuf);
+    if (PathIsDirW(versionDir)) {
+        wchar_t msg[700];
+        wsprintfW(msg, L"A version folder already exists for %s:\n%s\n\nPick a different version number.",
+            verBuf, versionDir);
+        MessageBoxW(hwnd, msg, L"The Choicer Voicer - Launcher", MB_ICONWARNING | MB_OK);
+        return;
+    }
+    /* SHCreateDirectoryExW (behind EnsureDirW) creates the whole nested
+       path in one go - no need to create modeDir separately first */
+    if (!EnsureDirW(versionDir)) {
+        MessageBoxW(hwnd, L"Couldn't create the version folder.",
+            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
+        return;
+    }
+
+    const wchar_t* exeFileName = wcsrchr(g_addVerExePath, L'\\');
+    exeFileName = exeFileName ? exeFileName + 1 : g_addVerExePath;
+    wchar_t destExePath[MAX_PATH];
+    wsprintfW(destExePath, L"%s\\%s", versionDir, exeFileName);
+
+    if (!CopyFileW(g_addVerExePath, destExePath, FALSE)) {
+        MessageBoxW(hwnd, L"Couldn't copy the EXE into the version folder.",
+            L"The Choicer Voicer - Launcher", MB_ICONERROR | MB_OK);
+        return;
+    }
+
+    /* display.txt holds the same version text the user typed in, read
+       back by ReadDisplayNameTxt as this version's label - plain UTF-8,
+       no BOM needed since the decoder already tolerates either and the
+       version string itself is always plain ASCII digits and dots */
+    wchar_t displayTxtPath[MAX_PATH];
+    wsprintfW(displayTxtPath, L"%s\\display.txt", versionDir);
+    HANDLE hFile = CreateFileW(displayTxtPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        int utf8Len = WideCharToMultiByte(CP_UTF8, 0, verBuf, -1, NULL, 0, NULL, NULL);
+        if (utf8Len > 0) {
+            char* utf8 = (char*)malloc((size_t)utf8Len);
+            if (utf8) {
+                WideCharToMultiByte(CP_UTF8, 0, verBuf, -1, utf8, utf8Len, NULL, NULL);
+                DWORD written = 0;
+                WriteFile(hFile, utf8, (DWORD)(utf8Len - 1), &written, NULL); /* drop the NUL */
+                free(utf8);
+            }
+        }
+        CloseHandle(hFile);
+    }
+
+    /* refresh the relevant dropdown so the new version shows up immediately */
+    VersionList* list = g_addVerIsNormal ? &g_normalVersions : &g_compatVersions;
+    HWND combo = g_addVerIsNormal ? g_hNormalCombo : g_hCompatCombo;
+    HWND launchBtn = g_addVerIsNormal ? g_hLaunchNormalBtn : g_hLaunchCompatBtn;
+    ScanModeFolder(modeDir, list);
+    PopulateVersionCombo(combo, list, launchBtn);
+    {
+        LRESULT idx = SendMessageW(combo, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)verBuf);
+        if (idx != CB_ERR) SendMessageW(combo, CB_SETCURSEL, (WPARAM)idx, 0);
+    }
+
+    HWND owner = g_hAddVerOwner;
+    CloseAddVersionPopup(hwnd);
+
+    wchar_t doneMsg[600];
+    wsprintfW(doneMsg, L"Version %s added to %s.", verBuf, g_addVerIsNormal ? L"Normal Mode" : L"Compatibility Mode");
+    MessageBoxW(owner, doneMsg, L"The Choicer Voicer - Launcher", MB_ICONINFORMATION | MB_OK);
+}
+
+static void UpdateAddVerCheckText(HWND ctl, BOOL state, const wchar_t* label)
+{
+    wchar_t buf[160];
+    wsprintfW(buf, L"%s %s", state ? L"\u2611" : L"\u2610", label);
+    SetWindowTextW(ctl, buf);
+}
+
+static LRESULT CALLBACK AddVersionWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: {
+        HDC hdc = (HDC)wParam;
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH b = CreateSolidBrush(g_darkMode ? COLOR_DARK_BG : COLOR_LIGHT_BG);
+        FillRect(hdc, &rc, b);
+        DeleteObject(b);
+        return 1;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC hdc = (HDC)wParam;
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, g_darkMode ? COLOR_DARK_TEXT : COLOR_LIGHT_TEXT);
+        return (LRESULT)(g_hBrushBg ? g_hBrushBg : GetSysColorBrush(COLOR_BTNFACE));
+    }
+    case WM_COMMAND:
+        switch (LOWORD(wParam)) {
+        case ID_ADDVER_BROWSE: {
+            wchar_t chosen[MAX_PATH];
+            if (BrowseForVersionExe(hwnd, chosen, MAX_PATH)) {
+                wcsncpy(g_addVerExePath, chosen, MAX_PATH - 1);
+                g_addVerExePath[MAX_PATH - 1] = 0;
+                SendMessageW(g_hAddVerExeEdit, WM_SETTEXT, 0, (LPARAM)g_addVerExePath);
+            }
+            return 0;
+        }
+        case ID_ADDVER_CHECK1:
+            g_addVerCheck1State = !g_addVerCheck1State;
+            UpdateAddVerCheckText(g_hAddVerCheck1, g_addVerCheck1State, g_addVerCheck1Label);
+            return 0;
+        case ID_ADDVER_CHECK2:
+            g_addVerCheck2State = !g_addVerCheck2State;
+            UpdateAddVerCheckText(g_hAddVerCheck2, g_addVerCheck2State, g_addVerCheck2Label);
+            return 0;
+        case ID_ADDVER_ADD:
+            PerformAddVersion(hwnd);
+            return 0;
+        case ID_ADDVER_CANCEL:
+            CloseAddVersionPopup(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        CloseAddVersionPopup(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void ShowAddVersionPopup(HWND hOwner, HINSTANCE hInst, BOOL isNormal)
+{
+    g_addVerIsNormal = isNormal;
+    g_addVerExePath[0] = 0;
+
+    static BOOL classRegistered = FALSE;
+    const wchar_t CLASS_NAME[] = L"CVLauncherAddVersionWnd";
+    if (!classRegistered) {
+        WNDCLASSW wc = {0};
+        wc.lpfnWndProc   = AddVersionWndProc;
+        wc.hInstance     = hInst;
+        wc.lpszClassName = CLASS_NAME;
+        wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+        wc.hbrBackground = NULL;
+        wc.hIcon         = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
+        RegisterClassW(&wc);
+        classRegistered = TRUE;
+    }
+
+    const int w = 420, h = 358;
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT rc = {0, 0, w, h};
+    AdjustWindowRect(&rc, style, FALSE);
+    int winW = rc.right - rc.left, winH = rc.bottom - rc.top;
+
+    RECT prc; GetWindowRect(hOwner, &prc);
+    int posX = prc.left + ((prc.right - prc.left) - winW) / 2;
+    int posY = prc.top + ((prc.bottom - prc.top) - winH) / 2;
+
+    g_hAddVerOwner = hOwner;
+
+    HWND hPop = CreateWindowExW(WS_EX_DLGMODALFRAME, CLASS_NAME,
+        isNormal ? L"Add Normal Mode Version" : L"Add Compatibility Mode Version",
+        style, posX, posY, winW, winH, hOwner, NULL, hInst, NULL);
+    if (!hPop) return;
+    ApplyDarkTitlebar(hPop, g_darkMode);
+
+    /* tall enough for 3 wrapped lines at this popup's font size - it was
+       clipped to 2 lines' worth of height before, cutting the text off */
+    wchar_t introText[200];
+    wsprintfW(introText, L"Pick the EXE for this %s version, give it a version number, then confirm below.",
+        isNormal ? L"Normal Mode" : L"Compatibility Mode");
+    HWND hIntro = CreateWindowW(L"STATIC", introText,
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 16, w - 40, 54, hPop, NULL, hInst, NULL);
+    SendMessageW(hIntro, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    g_hAddVerExeEdit = CreateWindowW(L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_READONLY,
+        20, 76, w - 40 - 90 - 10, 24, hPop, NULL, hInst, NULL);
+    SendMessageW(g_hAddVerExeEdit, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    HWND hBrowseBtn = CreateWindowW(L"BUTTON", L"Browse\u2026",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        w - 20 - 90, 75, 90, 26, hPop, (HMENU)(INT_PTR)ID_ADDVER_BROWSE, hInst, NULL);
+    SendMessageW(hBrowseBtn, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    HWND hVerLabel = CreateWindowW(L"STATIC", L"Version number (#.#.#), e.g. 1.5.3:",
+        WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 114, w - 40, 18, hPop, NULL, hInst, NULL);
+    SendMessageW(hVerLabel, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    g_hAddVerVersionEdit = CreateWindowW(L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+        20, 134, 160, 24, hPop, NULL, hInst, NULL);
+    SendMessageW(g_hAddVerVersionEdit, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    /* same "\u2610/\u2611 + label" toggle-button format the Dark Mode
+       control used before it moved into the sidebar, rather than native
+       checkboxes - kept consistent with the rest of the app's controls */
+    wsprintfW(g_addVerCheck1Label, L"I confirm this EXE is the %s version.",
+        isNormal ? L"Normal Mode" : L"Compatibility Mode");
+    wcscpy(g_addVerCheck2Label, L"I confirm this launcher's own EXE is in its own separate, isolated folder.");
+    g_addVerCheck1State = FALSE;
+    g_addVerCheck2State = FALSE;
+
+    g_hAddVerCheck1 = CreateWindowW(L"BUTTON", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_MULTILINE,
+        20, 174, w - 40, 34, hPop, (HMENU)(INT_PTR)ID_ADDVER_CHECK1, hInst, NULL);
+    SendMessageW(g_hAddVerCheck1, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+    UpdateAddVerCheckText(g_hAddVerCheck1, FALSE, g_addVerCheck1Label);
+
+    g_hAddVerCheck2 = CreateWindowW(L"BUTTON", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_MULTILINE,
+        20, 212, w - 40, 34, hPop, (HMENU)(INT_PTR)ID_ADDVER_CHECK2, hInst, NULL);
+    SendMessageW(g_hAddVerCheck2, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+    UpdateAddVerCheckText(g_hAddVerCheck2, FALSE, g_addVerCheck2Label);
+
+    HWND hAddBtn = CreateWindowW(L"BUTTON", L"Add Version",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+        20, h - 56, 150, 34, hPop, (HMENU)(INT_PTR)ID_ADDVER_ADD, hInst, NULL);
+    SendMessageW(hAddBtn, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    HWND hCancelBtn = CreateWindowW(L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        w - 20 - 110, h - 56, 110, 34, hPop, (HMENU)(INT_PTR)ID_ADDVER_CANCEL, hInst, NULL);
+    SendMessageW(hCancelBtn, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
+
+    EnableWindow(hOwner, FALSE);
+    ShowWindow(hPop, SW_SHOW);
+    UpdateWindow(hPop);
+    SetForegroundWindow(hPop);
+    SetFocus(hBrowseBtn);
+}
+
 /* ===================== GameBanana mod browser (Browse Mods tab) ===================== */
 
 /* ---- tiny bounded JSON scanner - not a general parser, just enough to
@@ -1860,7 +2196,7 @@ static BOOL g_modPendingAdvance = FALSE;
    at all), so those two stay a pure client-side resort of g_modEntries.
    Search is a separate endpoint (Util/Search/Results) with its own real
    captured request/response, wired in separately - see StartModFetch. */
-typedef enum { MODSORT_NEWEST = 0, MODSORT_NAME, MODSORT_LIKES, MODSORT_VIEWS } ModSortMode;
+typedef enum { MODSORT_NEWEST = 0, MODSORT_LIKES, MODSORT_VIEWS } ModSortMode;
 static ModSortMode g_modSortMode = MODSORT_NEWEST;
 static wchar_t g_modSearchQuery[128] = L"";
 static int g_modFilteredIndices[MAX_MOD_ENTRIES];
@@ -1888,17 +2224,16 @@ typedef struct { HWND hwnd; int page; ModSortMode sortMode; wchar_t searchQuery[
    Mod/Index, _aFilters[Generic_Category]=44064) - one with
    _sSort=Generic_MostViewed, one with _sSort=Generic_MostLiked, each
    returning correctly-ordered, correctly-scoped results. MODSORT_NEWEST
-   and MODSORT_NAME return NULL (omit _sSort entirely), since the
+   returns NULL (omit _sSort entirely), since the
    confirmed default behavior with no _sSort at all is newest-first, and
-   NAME has no known server-side equivalent - it stays a pure
-   client-side resort of whatever's loaded. */
+   NEWEST has no server value either (see above), so both fall to the
+   same default case. */
 static const wchar_t* ModSortServerValue(ModSortMode mode)
 {
     switch (mode) {
     case MODSORT_LIKES: return L"Generic_MostLiked";
     case MODSORT_VIEWS: return L"Generic_MostViewed";
     case MODSORT_NEWEST:
-    case MODSORT_NAME:
     default: return NULL;
     }
 }
@@ -2580,8 +2915,6 @@ static int ModEntryCompare(const void* a, const void* b)
     const ModEntry* ea = (const ModEntry*)a;
     const ModEntry* eb = (const ModEntry*)b;
     switch (g_modSortModeForCompare) {
-    case MODSORT_NAME:
-        return _wcsicmp(ea->name, eb->name);
     case MODSORT_LIKES:
         if (eb->likeCount != ea->likeCount) return (eb->likeCount > ea->likeCount) ? 1 : -1;
         return 0;
@@ -2657,15 +2990,14 @@ static LRESULT CALLBACK ModListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
         g_hModSearchEdit = CreateWindowW(L"EDIT", L"",
             WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-            10, 8, 300, 24, hwnd, (HMENU)(INT_PTR)ID_MODLIST_SEARCH, hInst, NULL);
+            12, 10, 340, 28, hwnd, (HMENU)(INT_PTR)ID_MODLIST_SEARCH, hInst, NULL);
         SendMessageW(g_hModSearchEdit, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
 
         g_hModSortCombo = CreateWindowW(L"COMBOBOX", NULL,
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
-            320, 8, 220, 200, hwnd, (HMENU)(INT_PTR)ID_MODLIST_SORT, hInst, NULL);
+            366, 10, 250, 200, hwnd, (HMENU)(INT_PTR)ID_MODLIST_SORT, hInst, NULL);
         SendMessageW(g_hModSortCombo, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
         SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Newest");
-        SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Name (A-Z)");
         SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Most Liked");
         SendMessageW(g_hModSortCombo, CB_ADDSTRING, 0, (LPARAM)L"Sort: Most Viewed");
         SendMessageW(g_hModSortCombo, CB_SETCURSEL, (WPARAM)g_modSortMode, 0);
@@ -2976,29 +3308,25 @@ static LRESULT CALLBACK ModListWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
             g_modCurrentPage = 0;
             g_modScrollY = 0;
 
-            if (ModSortServerValue(g_modSortMode) != NULL) {
-                /* Likes/Views are real server-side orderings - what's
-                   cached so far was fetched under a DIFFERENT order (or
-                   no particular order), so "most liked among an arbitrary
-                   newest-biased sample" isn't the same thing as "most
-                   liked overall". Start over with a fresh fetch in the
-                   actual requested order instead of just re-sorting the
-                   old cache. */
-                for (int i = 0; i < g_modCount; i++) {
-                    if (g_modEntries[i].thumb) DeleteObject(g_modEntries[i].thumb);
-                }
-                g_modCount = 0;
-                g_modFilteredCount = 0;
-                g_modNextPage = 1;
-                g_modPendingAdvance = FALSE;
-                StartModFetch(g_hModListWnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
-            } else {
-                /* Newest/Name have no server equivalent (Newest is just
-                   the default fetch order anyway) - re-sorting whatever
-                   is already cached, using its real stored dates/names,
-                   is correct regardless of what order it was fetched in. */
-                RebuildModListView();
+            /* Every sort mode is a genuinely different server-side
+               ordering (or, for Newest, the default order) - what's
+               cached was fetched under whichever mode was active
+               before, so it's the top N of THAT ordering, not a
+               representative sample of the new one. Re-sorting it
+               locally (e.g. "newest among an arbitrary most-liked-
+               biased sample") isn't the same thing as actually asking
+               for newest, and leaves g_modNextPage pointing at a page
+               sequence from the OLD query, corrupting pagination for
+               the new one. So any sort change clears the cache and
+               starts a completely fresh fetch - not just Likes/Views. */
+            for (int i = 0; i < g_modCount; i++) {
+                if (g_modEntries[i].thumb) DeleteObject(g_modEntries[i].thumb);
             }
+            g_modCount = 0;
+            g_modFilteredCount = 0;
+            g_modNextPage = 1;
+            g_modPendingAdvance = FALSE;
+            StartModFetch(g_hModListWnd, g_modNextPage, g_modSortMode, g_modSearchQuery);
             InvalidateRect(hwnd, NULL, FALSE);
             return 0;
         }
@@ -3131,80 +3459,94 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CREATE: {
         HINSTANCE hInst = ((LPCREATESTRUCTW)lParam)->hInstance;
 
-        g_fontTitle = CreateFontW(-22, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+        g_fontTitle = CreateFontW(-25, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        g_fontRegular = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        g_fontRegular = CreateFontW(-16, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        g_fontSmall = CreateFontW(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        g_fontSmall = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        g_fontIcon = CreateFontW(-26, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Symbol");
 
         LoadSettings();
         g_hInstance = hInst;
 
-        /* ===== tab row: Launcher / Browse Mods ===== */
-        #define TAB_TOP 15
-        #define TAB_H   32
-        #define TAB_BOTTOM (TAB_TOP + TAB_H)
+        /* ===== left sidebar: persistent icon navigation, always visible
+           regardless of which tab is active (same as the old tab/header
+           buttons were) ===== */
+        #define SIDEBAR_W 76
+        #define CONTENT_LEFT (SIDEBAR_W + 15)
+        #define CONTENT_TOP 20
 
-        g_hTabLauncherBtn = MakeButton(hwnd, hInst, L"Launcher", 15, TAB_TOP, 110, TAB_H, ID_TAB_LAUNCHER, g_fontRegular);
-        g_hTabBrowseBtn = MakeButton(hwnd, hInst, L"Browse Mods", 130, TAB_TOP, 140, TAB_H, ID_TAB_BROWSE, g_fontRegular);
+        CreateWindowW(L"STATIC", NULL, WS_CHILD | WS_VISIBLE | WS_BORDER,
+            0, 0, SIDEBAR_W, 620, hwnd, NULL, hInst, NULL);
 
-        /* ===== header bar: Mod Folder / Get Mods / Info on the left,
-           Dark Mode on the far right ===== */
-        #define HEADER_TOP (TAB_BOTTOM + 10)
-        #define HEADER_H   36
-        #define HEADER_BOTTOM (HEADER_TOP + HEADER_H)
-        #define CONTENT_TOP (HEADER_BOTTOM + 15)
+        g_hTabLauncherBtn = MakeButton(hwnd, hInst, L"\u25B6", 10, 24, 56, 56, ID_TAB_LAUNCHER, g_fontIcon);
+        g_hTabBrowseBtn = MakeButton(hwnd, hInst, L"\u25A6", 10, 94, 56, 56, ID_TAB_BROWSE, g_fontIcon);
+        MakeButton(hwnd, hInst, L"", 14, 500, 48, 48, ID_MODDING, g_fontIcon);
+        MakeButton(hwnd, hInst, L"", 18, 560, 40, 40, ID_README_INFO, g_fontIcon);
 
-        MakeButton(hwnd, hInst, L"Mod Folder", 15, HEADER_TOP, 140, HEADER_H, ID_MODDING, g_fontRegular);
-        MakeButton(hwnd, hInst, L"Get Mods", 165, HEADER_TOP, 140, HEADER_H, ID_GET_MODS, g_fontRegular);
-        MakeButton(hwnd, hInst, L"\u24D8", 315, HEADER_TOP, HEADER_H, HEADER_H, ID_README_INFO, g_fontRegular);
-
-        /* Owner-drawn, like every other header button - a native
-           BS_AUTOCHECKBOX keeps its check-glyph background theme-drawn no
-           matter what colors are returned from WM_CTLCOLORSTATIC, which is
-           exactly why it stood out with a mismatched light box in dark
-           mode. Drawing our own glyph avoids that entirely. */
-        g_hDarkModeCheck = MakeButton(hwnd, hInst, g_darkMode ? L"\u2611 Dark Mode" : L"\u2610 Dark Mode",
-            635 - 130, HEADER_TOP, 130, HEADER_H, IDC_DARKMODE_CHECK, g_fontRegular);
+        /* Dark Mode moved into the sidebar (was floating in the content
+           area at x=675,y=20) - it used to sit directly under where the
+           Browse Mods tab's list window gets created (also y=20), and
+           since that list window is a real, opaque sibling window
+           created afterward (later siblings default to a higher
+           z-order), it was drawing right over the Dark Mode button
+           whenever the Browse Mods tab was open. The sidebar is the one
+           part of the window already guaranteed to stay visible and
+           unobstructed on every tab, so this is a permanent fix rather
+           than just nudging coordinates around the list window again. */
+        g_hDarkModeCheck = MakeButton(hwnd, hInst, g_darkMode ? L"\u2600" : L"\u263E",
+            10, 164, 56, 56, IDC_DARKMODE_CHECK, g_fontIcon);
 
         /* side image */
         g_hBitmap = LoadBitmapW(hInst, MAKEINTRESOURCEW(IDB_SIDEIMAGE));
         HWND hImg = CreateWindowW(L"STATIC", NULL,
             WS_CHILD | WS_VISIBLE | SS_BITMAP,
-            15, CONTENT_TOP, 250, 333, hwnd, NULL, hInst, NULL);
+            CONTENT_LEFT, CONTENT_TOP, 290, 386, hwnd, NULL, hInst, NULL);
         SendMessageW(hImg, STM_SETIMAGE, (WPARAM)IMAGE_BITMAP, (LPARAM)g_hBitmap);
         TrackLauncherPageWnd(hImg);
 
-        int rx = 285;   /* right column x */
+        int rx = CONTENT_LEFT + 290 + 20;   /* right column x */
 
         g_overlayLabels[0].text = L"The Choicer Voicer";
-        g_overlayLabels[0].rect = (RECT){ rx, CONTENT_TOP + 5, rx + 230, CONTENT_TOP + 5 + 34 };
+        g_overlayLabels[0].rect = (RECT){ rx, CONTENT_TOP + 4, rx + 260, CONTENT_TOP + 4 + 38 };
         g_overlayLabels[0].font = g_fontTitle;
         g_overlayLabels[0].visible = TRUE;
 
         g_overlayLabels[1].text = L"Launcher; Choose a version from the dropdown windows to play the version you want.";
-        g_overlayLabels[1].rect = (RECT){ rx, CONTENT_TOP + 43, rx + 350, CONTENT_TOP + 43 + 54 };
+        g_overlayLabels[1].rect = (RECT){ rx, CONTENT_TOP + 46, rx + 404, CONTENT_TOP + 46 + 62 };
         g_overlayLabels[1].font = g_fontRegular;
         g_overlayLabels[1].visible = TRUE;
 
         /* Normal Mode card: bordered panel using more of the width/height
            alongside the side image, instead of a thin single-height row */
-        MakeGroupBox(hwnd, hInst, L"Normal Mode", rx, CONTENT_TOP + 117, 350, 98, g_fontRegular);
-        g_hNormalCombo = MakeCombo(hwnd, hInst, rx + 15, CONTENT_TOP + 151, 215, 200, IDC_NORMAL_COMBO, g_fontRegular);
-        g_hLaunchNormalBtn = MakeButton(hwnd, hInst, L"Launch", rx + 240, CONTENT_TOP + 151, 95, 30, ID_LAUNCH_NORMAL, g_fontRegular);
+        MakeGroupBox(hwnd, hInst, L"Normal Mode", rx, CONTENT_TOP + 130, 404, 112, g_fontRegular);
+        g_hNormalCombo = MakeCombo(hwnd, hInst, rx + 18, CONTENT_TOP + 166, 245, 200, IDC_NORMAL_COMBO, g_fontRegular);
+        g_hLaunchNormalBtn = MakeButton(hwnd, hInst, L"Launch", rx + 278, CONTENT_TOP + 166, 108, 34, ID_LAUNCH_NORMAL, g_fontRegular);
         TrackLauncherPageWnd(g_hNormalCombo);
         TrackLauncherPageWnd(g_hLaunchNormalBtn);
+        {
+            HWND hAddNormalBtn = MakeButton(hwnd, hInst, L"+ Add Version",
+                rx + 18, CONTENT_TOP + 208, 140, 28, ID_ADD_NORMAL_VERSION, g_fontSmall);
+            TrackLauncherPageWnd(hAddNormalBtn);
+        }
 
         /* Compatibility Mode card */
-        MakeGroupBox(hwnd, hInst, L"Compatibility Mode", rx, CONTENT_TOP + 229, 350, 98, g_fontRegular);
-        g_hCompatCombo = MakeCombo(hwnd, hInst, rx + 15, CONTENT_TOP + 263, 215, 200, IDC_COMPAT_COMBO, g_fontRegular);
-        g_hLaunchCompatBtn = MakeButton(hwnd, hInst, L"Launch", rx + 240, CONTENT_TOP + 263, 95, 30, ID_LAUNCH_COMPAT, g_fontRegular);
+        MakeGroupBox(hwnd, hInst, L"Compatibility Mode", rx, CONTENT_TOP + 260, 404, 112, g_fontRegular);
+        g_hCompatCombo = MakeCombo(hwnd, hInst, rx + 18, CONTENT_TOP + 296, 245, 200, IDC_COMPAT_COMBO, g_fontRegular);
+        g_hLaunchCompatBtn = MakeButton(hwnd, hInst, L"Launch", rx + 278, CONTENT_TOP + 296, 108, 34, ID_LAUNCH_COMPAT, g_fontRegular);
         TrackLauncherPageWnd(g_hCompatCombo);
         TrackLauncherPageWnd(g_hLaunchCompatBtn);
+        {
+            HWND hAddCompatBtn = MakeButton(hwnd, hInst, L"+ Add Version",
+                rx + 18, CONTENT_TOP + 338, 140, 28, ID_ADD_COMPAT_VERSION, g_fontSmall);
+            TrackLauncherPageWnd(hAddCompatBtn);
+        }
 
         /* discover versions on disk and fill the two dropdowns */
         {
@@ -3224,18 +3566,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             SelectRememberedVersion(g_hCompatCombo, &g_compatVersions, g_lastCompatExe);
         }
 
-        /* Everything below here spans the full window width, so it must start
-           below BOTH columns - the side image bottom is the taller of the
-           two, not just the right column's own content. The old Get Mods /
-           Modding Folder button row now lives in the header instead, so this
-           section starts directly with the "install mod to" row. */
-        #define MOD_SECTION_TOP (CONTENT_TOP + 333 + 16)
+        /* Everything below here spans the full content width, so it must
+           start below BOTH columns - the side image bottom is the taller
+           of the two, not just the right column's own content. */
+        #define MOD_SECTION_TOP (CONTENT_TOP + 386 + 20)
+        #define CONTENT_W (820 - CONTENT_LEFT - 15)
 
         g_overlayLabels[2].text = L"Install downloaded mod to:";
-        g_overlayLabels[2].rect = (RECT){ 15, MOD_SECTION_TOP, 15 + 190, MOD_SECTION_TOP + 20 };
+        g_overlayLabels[2].rect = (RECT){ CONTENT_LEFT, MOD_SECTION_TOP, CONTENT_LEFT + 220, MOD_SECTION_TOP + 24 };
         g_overlayLabels[2].font = g_fontRegular;
         g_overlayLabels[2].visible = TRUE;
-        g_hPackCombo = MakeCombo(hwnd, hInst, 210, MOD_SECTION_TOP - 4, 200, 200, IDC_PACK_COMBO, g_fontRegular);
+        g_hPackCombo = MakeCombo(hwnd, hInst, CONTENT_LEFT + 229, MOD_SECTION_TOP - 4, 230, 200, IDC_PACK_COMBO, g_fontRegular);
         for (int i = 0; i < NUM_PACK_FOLDERS; i++) {
             SendMessageW(g_hPackCombo, CB_ADDSTRING, 0, (LPARAM)PACK_FOLDERS[i]);
         }
@@ -3250,10 +3591,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HWND hDrop = CreateWindowW(L"STATIC",
             L"Drag a .zip/.rar file or a GameBanana mod link here",
             WS_CHILD | WS_VISIBLE | SS_CENTER | SS_CENTERIMAGE | WS_BORDER,
-            15, MOD_SECTION_TOP + 28, 620, 70, hwnd, (HMENU)(INT_PTR)IDC_DROPZONE, hInst, NULL);
+            CONTENT_LEFT, MOD_SECTION_TOP + 32, CONTENT_W, 80, hwnd, (HMENU)(INT_PTR)IDC_DROPZONE, hInst, NULL);
         SendMessageW(hDrop, WM_SETFONT, (WPARAM)g_fontRegular, TRUE);
-        g_dropZoneRect.left = 15; g_dropZoneRect.top = MOD_SECTION_TOP + 28;
-        g_dropZoneRect.right = 15 + 620; g_dropZoneRect.bottom = MOD_SECTION_TOP + 28 + 70;
+        g_dropZoneRect.left = CONTENT_LEFT; g_dropZoneRect.top = MOD_SECTION_TOP + 32;
+        g_dropZoneRect.right = CONTENT_LEFT + CONTENT_W; g_dropZoneRect.bottom = MOD_SECTION_TOP + 32 + 80;
         TrackLauncherPageWnd(hDrop);
 
         /* small subtitle under the drop zone explaining how to use the
@@ -3262,8 +3603,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             L"Tip: For the link method to work, add a https:// in front of the "
             L"'gamebanana.com/mods' link. The downloader won't work without it. "
             L"Download links [https://gamebanana.com/dl/######] also work.";
-        g_overlayLabels[3].rect = (RECT){ g_dropZoneRect.left, g_dropZoneRect.bottom + 4,
-                                           g_dropZoneRect.left + 620, g_dropZoneRect.bottom + 4 + 32 };
+        g_overlayLabels[3].rect = (RECT){ g_dropZoneRect.left, g_dropZoneRect.bottom + 6,
+                                           g_dropZoneRect.left + CONTENT_W, g_dropZoneRect.bottom + 6 + 40 };
         g_overlayLabels[3].font = g_fontSmall;
         g_overlayLabels[3].visible = TRUE;
 
@@ -3272,8 +3613,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
            tabs is just show/hide of two mutually-exclusive halves */
         {
             RECT crc; GetClientRect(hwnd, &crc);
-            int listH = crc.bottom - 15 - CONTENT_TOP;
-            g_hModListWnd = CreateModListWnd(hwnd, hInst, 15, CONTENT_TOP, 620, listH);
+            int listH = crc.bottom - 20 - CONTENT_TOP;
+            g_hModListWnd = CreateModListWnd(hwnd, hInst, CONTENT_LEFT, CONTENT_TOP, CONTENT_W, listH);
         }
 
         /* animated backdrop: tinted image + slow pulsing/drifting stars */
@@ -3337,25 +3678,70 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
             COLORREF fillColor = pressed ? fillPressed : (hovered ? fillHover : fillNormal);
             HBRUSH hFill = CreateSolidBrush(fillColor);
-            FillRect(dis->hDC, &dis->rcItem, hFill);
-            DeleteObject(hFill);
-
             HPEN hPen = CreatePen(PS_SOLID, 1, border);
             HGDIOBJ oldPen = SelectObject(dis->hDC, hPen);
-            HGDIOBJ oldBrush = SelectObject(dis->hDC, GetStockObject(NULL_BRUSH));
-            Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+            HGDIOBJ oldBrush = SelectObject(dis->hDC, hFill);
+
+            BOOL isCircleIcon = (dis->CtlID == ID_MODDING || dis->CtlID == ID_README_INFO);
+            if (isCircleIcon) {
+                Ellipse(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+            } else {
+                Rectangle(dis->hDC, dis->rcItem.left, dis->rcItem.top, dis->rcItem.right, dis->rcItem.bottom);
+            }
             SelectObject(dis->hDC, oldBrush);
             SelectObject(dis->hDC, oldPen);
+            DeleteObject(hFill);
             DeleteObject(hPen);
 
-            wchar_t buf[128];
-            GetWindowTextW(dis->hwndItem, buf, 128);
-            SetBkMode(dis->hDC, TRANSPARENT);
-            SetTextColor(dis->hDC, textColor);
-            HGDIOBJ oldFont = SelectObject(dis->hDC, g_fontRegular);
-            RECT textRect = dis->rcItem;
-            DrawTextW(dis->hDC, buf, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            SelectObject(dis->hDC, oldFont);
+            BOOL isSidebarIcon = (dis->CtlID == ID_TAB_LAUNCHER || dis->CtlID == ID_TAB_BROWSE ||
+                                   dis->CtlID == ID_MODDING || dis->CtlID == ID_README_INFO);
+
+            if (dis->CtlID == ID_MODDING) {
+                /* hand-drawn folder glyph: a rounded tab inset from the
+                   body's left edge, sitting just above (and slightly
+                   overlapping) a rounded body rectangle, so the two
+                   pieces read as one folder silhouette instead of two
+                   flush, sharp-cornered boxes - more reliable across
+                   systems than depending on a specific Unicode folder
+                   symbol being present in the UI font */
+                int cx = (dis->rcItem.left + dis->rcItem.right) / 2;
+                int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+                HBRUSH glyphBrush = CreateSolidBrush(textColor);
+                HGDIOBJ oldGB = SelectObject(dis->hDC, glyphBrush);
+                HGDIOBJ oldGP = SelectObject(dis->hDC, GetStockObject(NULL_PEN));
+                RoundRect(dis->hDC, cx - 9, cy - 8, cx + 1, cy - 2, 3, 3);
+                RoundRect(dis->hDC, cx - 11, cy - 4, cx + 11, cy + 8, 4, 4);
+                SelectObject(dis->hDC, oldGP);
+                SelectObject(dis->hDC, oldGB);
+                DeleteObject(glyphBrush);
+            } else if (dis->CtlID == ID_README_INFO) {
+                /* hand-drawn "i" glyph instead of the Unicode circled-i
+                   character (U+24D8) - that glyph already bakes its own
+                   circle in, which combined with this button's own
+                   drawn circular background produced two slightly
+                   different-sized, misaligned circles on top of each
+                   other. Drawing just the dot-and-stem here leaves the
+                   button's circle as the only circle. */
+                int cx = (dis->rcItem.left + dis->rcItem.right) / 2;
+                int cy = (dis->rcItem.top + dis->rcItem.bottom) / 2;
+                HBRUSH glyphBrush = CreateSolidBrush(textColor);
+                HGDIOBJ oldGB = SelectObject(dis->hDC, glyphBrush);
+                HGDIOBJ oldGP = SelectObject(dis->hDC, GetStockObject(NULL_PEN));
+                Ellipse(dis->hDC, cx - 3, cy - 10, cx + 3, cy - 4);
+                RoundRect(dis->hDC, cx - 3, cy - 2, cx + 3, cy + 10, 3, 3);
+                SelectObject(dis->hDC, oldGP);
+                SelectObject(dis->hDC, oldGB);
+                DeleteObject(glyphBrush);
+            } else {
+                wchar_t buf[128];
+                GetWindowTextW(dis->hwndItem, buf, 128);
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, textColor);
+                HGDIOBJ oldFont = SelectObject(dis->hDC, isSidebarIcon ? g_fontIcon : g_fontRegular);
+                RECT textRect = dis->rcItem;
+                DrawTextW(dis->hDC, buf, -1, &textRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dis->hDC, oldFont);
+            }
 
             if (dis->itemState & ODS_FOCUS) {
                 RECT focusRect = dis->rcItem;
@@ -3394,13 +3780,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             case ID_LAUNCH_NORMAL: LaunchSelectedVersion(hwnd, g_hNormalCombo, &g_normalVersions, TRUE); break;
             case ID_LAUNCH_COMPAT: LaunchSelectedVersion(hwnd, g_hCompatCombo, &g_compatVersions, FALSE); break;
             case ID_MODDING:       OpenModdingFolder(hwnd); break;
-            case ID_GET_MODS:      OpenGetMods(hwnd); break;
             case ID_README_INFO:   ShowFirstRunPopup(hwnd, g_hInstance); break;
             case ID_TAB_LAUNCHER:  SwitchTab(hwnd, TAB_LAUNCHER); break;
             case ID_TAB_BROWSE:    SwitchTab(hwnd, TAB_BROWSE); break;
+            case ID_ADD_NORMAL_VERSION: ShowAddVersionPopup(hwnd, g_hInstance, TRUE); break;
+            case ID_ADD_COMPAT_VERSION: ShowAddVersionPopup(hwnd, g_hInstance, FALSE); break;
             case IDC_DARKMODE_CHECK:
                 g_darkMode = !g_darkMode;
-                SetWindowTextW(g_hDarkModeCheck, g_darkMode ? L"\u2611 Dark Mode" : L"\u2610 Dark Mode");
+                SetWindowTextW(g_hDarkModeCheck, g_darkMode ? L"\u2600" : L"\u263E");
                 SaveSettings();
                 ApplyThemeColors(hwnd);
                 break;
@@ -3580,7 +3967,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
     wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPICON));
     RegisterClassW(&wc);
 
-    RECT rc = {0, 0, 650, 610};
+    RECT rc = {0, 0, 820, 620};
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     AdjustWindowRect(&rc, style, FALSE);
 
