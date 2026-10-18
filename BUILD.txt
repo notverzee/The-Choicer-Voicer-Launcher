@@ -8,7 +8,7 @@ Plain C using the native Win32 API, plus the vendored miniz library
 On Windows, with mingw-w64 installed (e.g. via MSYS2, MinGW64 shell):
 
     windres resource.rc -O coff -o resource.o
-    gcc -municode -O2 main.c resource.o miniz/miniz.c miniz/miniz_tinfl.c miniz/miniz_tdef.c miniz/miniz_zip.c -o "The Choicer Voicer Launcher.exe" -mwindows -lcomctl32 -lshell32 -lole32 -luuid -lwininet -ldwmapi -luxtheme -lcomdlg32 -lgdi32 -luser32 -s -I miniz
+    gcc -municode -O2 main.c resource.o miniz/miniz.c miniz/miniz_tinfl.c miniz/miniz_tdef.c miniz/miniz_zip.c -o "The Choicer Voicer Launcher.exe" -mwindows -lcomctl32 -lshell32 -lole32 -luuid -lwininet -ldwmapi -luxtheme -lcomdlg32 -lgdi32 -luser32 -lmfplat -lmfreadwrite -lmfuuid -lmsimg32 -lwinmm -s -I miniz
 
 (Added since the last version: -lole32 -luuid for OLE drag-drop of
 dragged web links, -lwininet for downloading mods, -ldwmapi for the
@@ -632,3 +632,120 @@ FIXED: Add Version popup - two things.
   before it moved into the sidebar, so this popup's controls read
   consistently with the rest of the app rather than mixing in native
   Windows checkbox chrome.
+
+--- THIS PASS ---
+CHANGED: Add Version popup - the second confirmation toggle ("I confirm this launcher's own EXE is in its own separate, isolated folder.") is taller (34 -> 54 px) so its wrapped text is no longer cut off.
+
+FIXED: Add Version popup - the version number text box stayed white in dark mode. Cause: editable boxes send WM_CTLCOLOREDIT, which that popup never handled (only WM_CTLCOLORSTATIC, which read-only/label controls use). Added a handler using the same panel colors as the rest of the dark theme. (The read-only EXE path box already followed the theme.) Note: the Browse Mods search box has no WM_CTLCOLOREDIT handler either, so it may still be white in dark mode.
+
+CHANGED: all UI text now uses the Anton font (SIL Open Font License - free to embed, license text in OFL-Anton.txt). Anton-Regular.ttf is compiled into the EXE as an RCDATA resource (resource.rc, IDR_UIFONT) and registered for the launcher's own process with AddFontMemResourceEx, so nothing has to be installed. Falls back to Segoe UI if loading fails. Anton is taller/wider than Segoe UI at the same size, so the font sizes were reduced ~14%. Anton has no glyphs for the checkbox squares / back arrow, so those (and the sidebar icons) still use Segoe UI Symbol. MessageBox pop-ups are drawn by Windows and keep the system font.
+(Refuel was tried first but its license forbids embedding it in software, so it is not used.)
+
+--- DUB RENDERER TAB ---
+NEW: a "Dub Renderer" tab (microphone button in the sidebar; Dark Mode button moved down one slot). All of its code is in dubrender.inc, which main.c #includes just before SwitchTab() - the build command above is unchanged and no new libraries are needed.
+It is a C port of the STANDARD half of the open-source Choicer Voicer Dub Renderer (Go, MIT). The co-op section was not ported. Same behavior: finds exports under %APPDATA%\YeahMaybe\ChoicerVoicer\game\recordings\dub_recordings, auto-matches the pack in packs_voice, mixes the timed voice clips in batches of 20 with the _backing_track, centers one-sided mono recordings, and encodes H.264/AAC MP4 with FFmpeg.
+Differences from the original: runs inside the launcher; has a Cancel button (kills FFmpeg and removes a half-written MP4); FFmpeg is checked when the tab is first opened and winget is only used AFTER the user confirms a prompt (the original installed automatically on startup); the log uses Consolas (FFmpeg output is unreadable in Anton).
+The sidebar icon is hand-drawn in code (DrawMicGlyph). To use PNG art like the other buttons, add dubblack.png / dubwhite.png to resource.rc (IDP_DUB_BLACK / IDP_DUB_WHITE), load them next to the other icons in WM_CREATE, and add a case ID_TAB_DUB to the iconBmp switch in WM_DRAWITEM.
+
+--- DARK MODE BUTTON ---
+CHANGED: the Dark Mode button is now a 48px circle in the bottom group of the sidebar (above the Modding Folder and info buttons), matching them. themeblack.png / themewhite.png were re-cut from the original sun/moon art into circles with the same fill and ring as folderblack/folderwhite.
+
+--- LIGHT MODE TEXT ---
+CHANGED: light-mode text is softer - COLOR_LIGHT_TEXT went from RGB(20,20,20) to RGB(82,82,90) (one define near the top of main.c; raise or lower those numbers to taste). The Dub Renderer's muted captions were lightened to match.
+
+--- DUB RENDERER CREDIT ---
+NEW: a circular (i) in the top right of the Dub Renderer tab (same art as the sidebar's info button) opens an "About the Dub Renderer" popup crediting TDTLuv's Choicer Voicer Dub Renderer source code, with a clickable link to https://gamebanana.com/tools/23587.
+
+--- DUB RENDERER FIXES ---
+FIXED: the Dub Renderer's (i) was drawn by shrinking the 192px sidebar art, which dropped the thin stem (only the dot showed). It is now drawn in code (DubDrawInfoIcon) at 4x and smoothed down, so it stays crisp at any size.
+FIXED: Dub Renderer text was clipped because Anton's line box is ~1.7x its font size and the controls had fixed heights. DubLayout() now measures each font (DubFontH) and stacks the rows from those real heights.
+
+--- BUTTON TOOLTIPS ---
+NEW: hovering any button shows a short description. MakeButton() registers every button with one shared tooltip window (g_hTip); the text for each comes from ButtonTipText(), a single switch on the button's ID defined just before SwitchTab() in main.c - edit the wording there, or add a case for any new button. Tooltips follow light/dark mode (ApplyTipTheme). Disabled buttons don't show one (Windows doesn't send them mouse events).
+
+--- RESIZABLE WINDOW / FULL SCREEN / MUSIC ---
+NEW (all in extras.inc, included from main.c; the build command above now also needs -lwinmm for the music):
+* The window can be resized and maximized (minimum = the original 820x620 client area). LayoutMainWindow() re-flows everything on every resize: the sidebar (tab buttons stay at the top, the four round buttons are anchored to the bottom), the Browse / Installed / Dub Renderer windows, and the Launcher page (the artwork and the Normal / Compatibility cards grow, the cards stretch sideways, the Get Mods card is pinned to the bottom). At the minimum size it reproduces the original layout.
+* Browse Mods and Installed Mods get an extra column of cards each time the window gains room for another one (ListColsForWidth: one card needs ~330px). MODLIST_COLS / INSTLIST_COLS are now variables (g_modCols / g_instCols) instead of the constant 2.
+* Full screen: the button under the tabs, F11, or Esc to leave. Borderless on whichever monitor the window is on; the previous size / maximized state is restored.
+* Round buttons are now a column of four, all 48px: Dark Mode, Modding Folder, Music, Info. The Music button is drawn in code (DrawMusicIcon): slashed when off, blue ring when on.
+* Music: bgm.mp3 is compiled into the EXE (IDR_MUSIC in resource.rc), unpacked to %TEMP%\ChoicerVoicerLauncher_bgm.mp3 the first time it's switched on, and played through MCI. It loops: the "notify" flag makes Windows send MM_MCINOTIFY when the track ends and WndProc restarts it. On/off is remembered in launcher_settings.ini (MusicOn=). It starts OFF the first time.
+* The track is "Water Gloss" by 9jackjack8 (from the filename of the file that was supplied) - check its license / credit the artist if you distribute the EXE, since it's baked into it.
+
+--- SETTINGS TAB + HOME PAGE FIXES ---
+NEW (settings.inc, included after extras.inc): the four round buttons (dark mode, modding folder, music, info) are gone. One round gear button at the bottom of the sidebar (DrawGearIcon, ring turns blue while open) opens a Settings tab containing:
+  Appearance - Dark mode: On/Off button
+  Music      - round music button (on/off), "Music is on/off" label, and a volume slider (custom-drawn, drag it or use the mouse wheel; live while playing; 0-100, default 60, saved as MusicVolume= in launcher_settings.ini)
+  Folders    - Open Modding Folder
+  About      - a read-only text box with the old info text, plus an Open README button
+The first-run welcome popup is unchanged (it still appears on first start). The full screen button stays under the tabs. A toggle for dark mode is SettingsToggleDark().
+FIXED: version dropdowns vanishing after a resize - the Normal/Compatibility card panels were repainting over the combo boxes because the sidebar/page children lacked WS_CLIPSIBLINGS. ClipSiblingsProc adds it to every direct child of the main window at the end of WM_CREATE.
+FIXED: home page flicker/choppiness - (1) all controls are moved in one batch with DeferWindowPos (LMove in extras.inc), (2) the tinted backdrop is scaled once into a cache bitmap (PaintAnimatedBackdrop) instead of re-stretching it with HALFTONE on every animation frame, which was very slow on big windows.
+
+--- SOFTER LOOK: CUSTOM TITLE BAR, ROUNDED WINDOW / CARDS / BUTTONS ---
+NEW (uikit.inc, included near the top of main.c just before PaintAnimatedBackdrop):
+* No standard Windows title bar or frame. The window is WS_POPUP | WS_THICKFRAME (the thick frame is kept only so edge-resize, Aero snap and min/max keep working); WM_NCCALCSIZE returns 0 so the whole window is ours, WM_NCHITTEST supplies the invisible 7px resize edges and makes the top strip (g_titleH = 36px) the drag area (double-click maximizes). The strip - app icon, "The Choicer Voicer Launcher", and the minimize / maximize-restore / close buttons - is painted by PaintTitleBar() and DrawCaptionButton() (glyphs come from the Segoe MDL2 Assets font; close turns red on hover). In full screen the strip is hidden (g_titleH = 0).
+* Rounded window: Windows 11 is asked for rounded corners (DWMWA_WINDOW_CORNER_PREFERENCE); on Windows 10 the window is clipped to a rounded region instead (ApplyWindowRounding in extras.inc, not while maximized / full screen).
+* Smooth rounded shapes: GDI's RoundRect has jagged corners, so DrawRoundedAA / DrawCardAA / DrawOutlineAA render the shapes from a signed-distance formula (anti-aliased, no extra library). Owner-drawn buttons use it (DrawThemedOwnerButton); PaintButtonSurround() first restores the pixels behind the corners.
+* The Launcher page's three cards are now rounded panels painted into the backdrop (their old rectangular panel windows are kept at zero size). The four tab pages lost their sunken borders, got rounded corners (window regions) and a thin smooth outline; the side artwork is rounded too.
+* Layout: CONTENT_TOP is now (g_titleH + 12), the minimum client size is 820x648 (same content area as before + the title bar), and the tab buttons are placed by LayoutMainWindow().
+* Popup windows (Add Version, the welcome message, etc.) still use the normal Windows frame.
+
+--- FIX: SIDEBAR BUTTONS MISSING (z-order) ---
+Child windows created LATER sit BELOW earlier ones, so the sidebar panel (created first) was on top of every sidebar button. It only worked before because siblings weren't clipped; once WS_CLIPSIBLINGS was added (ClipSiblingsProc, to stop the version dropdowns vanishing) the panel hid all the buttons. WM_CREATE now sends g_hSidebarPanel to HWND_BOTTOM explicitly. If you ever add a background-style window that overlaps controls, send it to the bottom the same way.
+Also: card title labels are now sized from the font height (they clipped descenders), and the title bar text uses the regular UI size and a stronger color.
+(Testing tip: this builds and RUNS under Wine + Xvfb on Linux - that is how the missing-sidebar bug was found. Wine lacks Segoe MDL2 Assets, so the min/max/close glyphs show as boxes there; on Windows they are fine.)
+
+--- FIX: HOME TAB LEFT-OVERS AFTER RESIZING ---
+After resizing on the Launcher tab, pieces of the old layout (card outlines, ghost dropdowns, white strips) stayed on screen until the window was reloaded. Two causes, both in extras.inc: (1) moved controls had their OLD pixels copied to the new position - LMove now passes SWP_NOCOPYBITS; (2) the end of LayoutMainWindow only did InvalidateRect(.., FALSE), which does not repaint the backdrop (the animated background is painted from WM_ERASEBKGND) - it now does RedrawWindow(RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN).
+Verified under Wine/Xvfb by resizing the window six times in a row and toggling F11 on and off.
+
+--- HOME PAGE: GET MODS CARD REMOVED, NEW LAYOUT, CHEAPER RESIZING ---
+* The "Get Mods" card (text + Open Browse Mods button) is gone from the Launcher page.
+* LayoutLauncherPage (extras.inc) lays the page out as one centered group: the artwork on the left; on its right the logo and the Normal / Compatibility cards spaced evenly down the artwork's height (the right column is 1.4x the artwork's width). The group scales with the window keeping the artwork's proportions and sits slightly above vertical center. Only 2 cards' worth of controls plus the artwork move on a resize now.
+* Cheaper live resizing: g_sizing is TRUE between WM_ENTERSIZEMOVE and WM_EXITSIZEMOVE; while dragging, the artwork and the backdrop are scaled with the fast COLORONCOLOR mode and the artwork size is rounded to 8px steps, then both are rebuilt once at full (HALFTONE) quality when the mouse is released. The backdrop cache state moved to uikit.inc so WM_EXITSIZEMOVE can reset it.
+
+--- CODE-DRAWN SIDEBAR ICONS + ABOUT BOX ---
+* Home, Browse Mods, Installed Mods, Dub Renderer and Full screen buttons are now drawn in code (DrawSidebarTabIcon / DrawTabGlyph in extras.inc), in the same style as the gear and music buttons: a soft rounded button with a simple line glyph, rendered at 4x and halftone-shrunk for smooth edges. Home = house, Browse = globe, Installed = bulleted list, Dub = microphone, Full screen = corner brackets (pointing inward while in full screen). Hover brightens the border; the active tab gets a blue ring and a faint blue tint. Works in light and dark mode. The old homeblack/homewhite, browseblack/browsewhite and modsblack/modswhite PNGs are no longer used for the buttons (they are still in resource.rc; delete them if you want a smaller EXE).
+* Settings > About is now a rounded card painted by the Settings page (DrawCardAA + DrawText) instead of an EDIT control, so there is no caret, selection or typing in it.
+* Settings captions ("Dark mode: On/Off", "Music is on/off") are refreshed at startup (SettingsRefresh() after CreateSettingsWnd).
+
+--- SIDEBAR: FULL SCREEN BUTTON MOVED ---
+The full screen button now sits at the bottom of the sidebar, directly above the Settings gear (LayoutMainWindow in extras.inc), and follows the bottom edge as the window is resized. The four tab buttons (Home, Browse, Installed, Dub Renderer) stay at the top.
+
+--- BROWSE MODS: SHOW EVERY CATEGORY, NOT JUST DUB MODE ---
+Browse Mods asked GameBanana for one category only (_aFilters[Generic_Category]=44064, "Dub Mode"), so mods in the game's other categories never appeared in the default list - only search (which scopes by game, Util/Search/Results _idGameRow) found them. ModBrowserFetchThreadProc (main.c) now asks for the whole game: Mod/Index?_aFilters[Generic_Game]=20674 (+ _sSort as before). The existing client-side _aGame._idRow check still discards anything from another game.
+Safety net (g_gameFilterMode): the first page is checked - if at least MODS_PER_PAGE/2 of its records are this game's, the filter works and is used for the rest of the session; if not (the server ignored the filter), it redoes that page with the old single-category query and keeps using it (old behavior); if the first whole-game request errors out, that one fetch falls back to the category query without remembering it.
+NOT verified against the live GameBanana API (the build sandbox can't reach gamebanana.com) - if Browse still shows only Dub Mode mods, the filter name is the thing to change (the URL is built right after the "isSearch" branch of that function).
+
+--- SETTINGS > CREDITS ---
+A "Credits" button next to "Open README" at the bottom of the Settings page opens a credits view inside the same page (SettingsShowView in settings.inc; a Back button returns). Four rounded cards: The Choicer Voicer (YeahMaybe), the Choicer Voicer Dub Renderer (TDTLuv, link to https://gamebanana.com/tools/23587), the music (Water Gloss (Frutiger Aero) by 9jackjack8 - title taken from the MP3's file name) and Claude Sonnet 5.5 (Anthropic). Card heights come from the wrapped text (SettingsLayoutCredits). Links are clickable (hand cursor). To change the wording or add a credit, edit the g_credits[] table at the top of settings.inc (and bump the array size / loop counts from 4).
+
+--- COLOUR THEMES + BACKGROUND STARS ---
+* Themes: Settings > Appearance > Color has five swatches - Default (the original neutral gray), Purple, Red, Green, Blue. The Dark mode switch decides whether you get the dark or the light variant of the chosen colour, so you get dark purple / red / green / blue and light purple / red / green / blue. Palettes live in main.c (g_darkPals[] / g_lightPals[], struct ThemePal): bg, panel, pressed, border, text, accent, plus a tint colour that is blended over the backdrop picture. The old COLOR_DARK_* / COLOR_LIGHT_* names are now macros reading the active palette, so every existing draw call follows the theme; Pal() returns the active ThemePal and THEME_ACCENT its accent. To tweak or add a colour, edit those two tables (and NUM_THEMES / g_themeNames). Saved as Theme= in launcher_settings.ini.
+* Everything that used hard-coded grays or the old blue now derives from the palette (sidebar buttons, gear/music icons, title bar, caption buttons, sliders, tooltips, hover/disabled button colours, the Dub Renderer (i)).
+* Background stars: Settings > Appearance > Background stars slider, 0..100 (default 40, the old fixed count). 0 removes them and also stops the animation timer (ApplyStarCount in extras.inc), so an idle launcher uses no CPU. Saved as Stars=. NUM_STARS (100) is the array size / slider maximum; g_starCount is how many are drawn.
+* The two sliders (music volume and stars) share one implementation (g_sliders[] in settings.inc).
+
+--- SETTINGS: ABOUT OVERHAUL ---
+The old About text box is gone. Settings now has three views (g_setView in settings.inc): 0 = the normal settings, 1 = Credits, 2 = About. The main page's last section ("More") is a row of buttons: About this launcher, Credits, Open README. The About page (SettingsLayoutAbout / SettingsPaintAbout) has a hero card (app icon, "The Choicer Voicer Launcher", "Built <date>" - the compile date via __DATE__, so it is always true and never needs updating - and a one-line description), a "Getting started" card with three numbered steps (README first; pick a version and Launch / + Add Version; Browse Mods / Installed Mods / Dub Renderer), and a link row: Open README, Game page (itch.io), GameBanana page, Credits. Everything is painted (no edit controls), card heights come from the wrapped text, Back returns to where you came from (About -> Credits -> Back goes to About). The wording lives in ABOUT_TAGLINE / ABOUT_STEPS at the top of settings.inc.
+
+--- BROWSE MODS: TYPE FILTERS (learned from KevTheDev01's TCV Mod Manager) ---
+What the TCV Mod Manager (https://github.com/KevTheDev01/tcv-mod-manager) does, from its source (src/main.js + src-tauri/src/lib.rs):
+  * It lists mods with GET https://gamebanana.com/apiv11/Game/20674/Subfeed?_nPage=N - the game's own feed, so every category is included - keeps records with _sModelName == "Mod" and _bHasFiles == true, and reads each one's _aRootCategory._sName.
+  * It has NO server-side category filter: it pages through everything and classifies each mod CLIENT-SIDE from keywords in that category name - player|contestant -> Players, studio -> Studios, judge -> Judges, menu -> Menus, host -> Hosts, chatter -> Chatter, anything else -> Voice & Dub - and shows tabs All / Voice & Dub / Players / Studios / Judges / Menus / Hosts / Chatter.
+What was added here (additive - the existing paging, caching, search and sort code is unchanged):
+  * main.c: ModType / g_modTypeLabels / ModTypeFromCategory() - the same keyword mapping. A row of "chips" under the search row (ModTypeChipLayout, painted + hit-tested inside ModListWndProc; MODLIST_HEADER_H grew 40 -> 76). Picking a chip behaves like changing the sort (ModSetTypeFilter: clear the cache, fetch again).
+  * The fetch thread keeps only mods of the chosen type (before any thumbnail is downloaded) and, while a chip is active, may scan up to 20 raw pages instead of 6 so rare types still fill a batch. RebuildModListView also applies the chip.
+  * Default (Newest, no search) browse now uses the Mod Manager's Subfeed listing first - this is what shows mods from EVERY category rather than only one. Subfeed records have no _aGame / dates / _aPreviewContent, so: the game check is relaxed for them (the URL already scopes the game), their _aPreviewMedia._aImages picture is used, their own order is kept, and "no more pages" means an empty page. If the Subfeed request fails or yields <3 mods on the first page the launcher falls back (per g_subfeedState) to the earlier Mod/Index Generic_Game request and then the single-category request - Most Liked / Most Viewed still use Mod/Index.
+  * Tested against a local fake GameBanana serving the JSON shape the Mod Manager reads (Subfeed works / Subfeed 404): all categories listed, thumbnails loaded, the Hosts chip showed only Hosts mods, fallback chain worked. NOT tested against the live GameBanana API (the build sandbox can't reach it).
+Credits: Settings > Credits has a "TCV Mod Manager - KevTheDev01" card with the GitHub link; with five cards the credits page now scrolls with the mouse wheel (SettingsLayoutCredits / g_credScroll in settings.inc).
+
+--- BROWSE FILTER FIX: KEEP LOADING WHILE A TYPE CHIP HAS TOO FEW RESULTS ---
+Problem: with a type chip selected, one fetch scans at most 20 raw GameBanana pages and then stops; if none of the scanned mods were of that type the list said "No mods of this type were found" even though plenty existed deeper in the feed (only the newest few hundred mods had been looked at). The TCV Mod Manager avoids this by loading everything; the launcher fetches one batch at a time.
+Fix (main.c, all additive):
+  * The WM_APP_MODS_LOADED handler now chains further fetches by itself while a chip is active, more of the feed is unread (g_modHasMore) and fewer than a page (MODLIST_PAGE_SIZE) of results have turned up. g_modAutoLeft is a budget of MOD_AUTO_FETCH_BUDGET (12) chained fetches (each can scan 20 raw pages); every fetch the USER starts (chip, sort, search, Next) refills it (StartModFetch / g_modAutoFetch). When the budget runs out the list says how many mods were checked and that Next keeps looking.
+  * Progress: the fetch thread posts WM_APP_MODS_PROGRESS after each raw page; the empty area shows "Looking for <type> mods... N mods checked so far" (g_modScanned) instead of "none found" until the feed really ends.
+  * "No mods of this type were found." now only appears once the feed has been read to the end. If the launcher could only list the single Dub Mode category (both the Subfeed and the Mod/Index whole-game requests failed -> g_subfeedState == 2 && g_gameFilterMode == 2) it says so instead, because other types genuinely can't be listed in that mode.
+  * The first-page Subfeed check is more forgiving: one real Mod on a page is enough, and a page of only threads/WIPs no longer makes the launcher give up on Subfeed (it looks at up to 3 pages first).
+  * Verified against a local fake GameBanana whose feed has 120 pages, Hosts only deep in it and no Judges at all: the Hosts chip showed the progress text and then the Hosts mods; the Judges chip scanned the whole feed and then reported none. NOT tested against the live API.

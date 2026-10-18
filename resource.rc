@@ -1,10 +1,42 @@
+#define IDR_MUSIC     131
+#define IDR_UIFONT    130
 #define IDB_SIDEIMAGE 100
 #define IDI_APPICON   101
 #define IDB_BGLIGHT   102
 #define IDB_BGDARK    103
+
+#define IDP_HOME_BLACK    110
+#define IDP_HOME_WHITE    111
+#define IDP_BROWSE_BLACK  112
+#define IDP_BROWSE_WHITE  113
+#define IDP_MODS_BLACK    114
+#define IDP_MODS_WHITE    115
+#define IDP_THEME_BLACK   116
+#define IDP_THEME_WHITE   117
+#define IDP_FOLDER_BLACK  118
+#define IDP_FOLDER_WHITE  119
+#define IDP_INFO_BLACK    120
+#define IDP_INFO_WHITE    121
+#define IDP_LOGO          122
 
 IDB_SIDEIMAGE  BITMAP  "sideimage.bmp"
 IDI_APPICON    ICON    "appicon.ico"
 IDB_BGLIGHT    BITMAP  "bg_light.bmp"
 IDB_BGDARK     BITMAP  "bg_dark.bmp"
 1              24      "manifest.xml"
+
+IDP_HOME_BLACK    RCDATA  "homeblack.png"
+IDP_HOME_WHITE    RCDATA  "homewhite.png"
+IDP_BROWSE_BLACK  RCDATA  "browseblack.png"
+IDP_BROWSE_WHITE  RCDATA  "browse_white.png"
+IDP_MODS_BLACK    RCDATA  "modsblack.png"
+IDP_MODS_WHITE    RCDATA  "modswhite.png"
+IDP_THEME_BLACK   RCDATA  "themeblack.png"
+IDP_THEME_WHITE   RCDATA  "themewhite.png"
+IDP_FOLDER_BLACK  RCDATA  "folderblack.png"
+IDP_FOLDER_WHITE  RCDATA  "folderwhite.png"
+IDP_INFO_BLACK    RCDATA  "infoblack.png"
+IDP_INFO_WHITE    RCDATA  "infowhite.png"
+IDP_LOGO          RCDATA  "logo.png"
+IDR_UIFONT      RCDATA  "Anton-Regular.ttf"
+IDR_MUSIC       RCDATA  "bgm.mp3"
